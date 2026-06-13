@@ -1,0 +1,42 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+venv.bak/
+
+# IDEs and editors
+.vscode/
+.idea/
+*.code-workspace
+
+# Pytest
+.pytest_cache/
+
+# Mypy
+.mypy_cache/
+
+# Environment variables
+.env
+.env.*
+
+# Databases
+*.sqlite3
+*.db
+
+# Logs
+*.log
+
+# macOS
+.DS_Store
