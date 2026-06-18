@@ -5,3 +5,10 @@ passlib[bcrypt]
 python-multipart
 email-validator
 python-dotenv
+supabase
+pydantic-settings
+sqlalchemy
+psycopg2-binary
+asyncpg
+alembic
+bcrypt
