@@ -47,7 +47,7 @@ async def get_me(
 async def list_products(db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         select(Product)
-        .options(selectinload(Product.images))
+        .options(selectinload(Product.images), selectinload(Product.store), selectinload(Product.category))
         .where(Product.is_deleted == False)
     )
     products = result.scalars().all()
@@ -68,7 +68,10 @@ async def list_products(db: AsyncSession = Depends(get_db)):
             "description": product.description,
             "price": product.price,
             "stock": product.stock,
-            "image_url": image_url
+            "image_url": image_url,
+            "images": [img.image_url for img in product.images],
+            "store_name": product.store.store_name if product.store else "SEAPEDIA Store",
+            "category_name": product.category.name if product.category else "Unknown"
         })
         
     return response_list
@@ -77,7 +80,7 @@ async def list_products(db: AsyncSession = Depends(get_db)):
 async def get_product(product_id: int, db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         select(Product)
-        .options(selectinload(Product.images))
+        .options(selectinload(Product.images), selectinload(Product.store), selectinload(Product.category))
         .where(Product.id == product_id, Product.is_deleted == False)
     )
     product = result.scalar_one_or_none()
@@ -98,7 +101,10 @@ async def get_product(product_id: int, db: AsyncSession = Depends(get_db)):
         "description": product.description,
         "price": product.price,
         "stock": product.stock,
-        "image_url": image_url
+        "image_url": image_url,
+        "images": [img.image_url for img in product.images],
+        "store_name": product.store.store_name if product.store else "SEAPEDIA Store",
+        "category_name": product.category.name if product.category else "Unknown"
     }
 
 @router.post("/reviews", response_model=dict)

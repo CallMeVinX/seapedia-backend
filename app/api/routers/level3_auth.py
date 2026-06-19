@@ -61,9 +61,6 @@ async def login(request: LoginRequest, db: AsyncSession = Depends(get_db)):
             detail="Incorrect email or password",
         )
     
-    # Get all owned roles
-    owned_roles = await get_user_roles(db, str(user.id))
-    
     # Generate initial token WITHOUT active_role
     access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
@@ -73,11 +70,7 @@ async def login(request: LoginRequest, db: AsyncSession = Depends(get_db)):
     
     return {
         "access_token": access_token,
-        "token_type": "bearer",
-        "id": str(user.id),
-        "email": user.email,
-        "full_name": user.full_name,
-        "roles": owned_roles
+        "token_type": "bearer"
     }
 
 @router.post("/select-role", response_model=TokenResponse)
@@ -112,3 +105,9 @@ async def select_role(
     
     return {"access_token": active_role_token, "token_type": "bearer"}
 
+@router.get("/roles", response_model=list[str])
+async def get_available_roles():
+    """
+    Returns all available roles in the SEAPEDIA system.
+    """
+    return [role.value for role in AppRole]
