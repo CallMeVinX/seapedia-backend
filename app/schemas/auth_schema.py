@@ -25,13 +25,8 @@ class UserResponse(BaseModel):
     owned_roles: List[str]
     active_role: Optional[str] = None
 
-class LoginResponse(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
-    id: str
-    email: str
-    full_name: str
-    roles: List[str]
+class LoginResponse(TokenResponse):
+    pass
 
 class FinancialsResponse(BaseModel):
     walletBalance: float = 0.0

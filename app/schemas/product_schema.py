@@ -9,5 +9,8 @@ class ProductResponse(BaseModel):
     price: Decimal
     stock: int
     image_url: Optional[str] = None
+    images: list[str] = []
+    store_name: str
+    category_name: str
 
     model_config = ConfigDict(from_attributes=True)
