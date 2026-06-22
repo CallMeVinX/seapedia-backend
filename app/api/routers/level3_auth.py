@@ -62,7 +62,8 @@ async def login(request: LoginRequest, db: AsyncSession = Depends(get_db)):
         )
     
     # Generate initial token WITHOUT active_role
-    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    expire_minutes = 60 * 24 * 30 if request.remember_me else 60 * 24 * 1 # 30 days or 1 day
+    access_token_expires = timedelta(minutes=expire_minutes)
     access_token = create_access_token(
         user_id=str(user.id),
         expires_delta=access_token_expires
