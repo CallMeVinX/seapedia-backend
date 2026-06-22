@@ -5,7 +5,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 import time
 
 from app.core.config import settings
-from app.api.routers import level3_auth, level4_core
+from app.api.routers import level3_auth, level4_core, level5_dashboards
 from app.core.exceptions import http_exception_handler, validation_exception_handler, generic_exception_handler
 
 app = FastAPI(title=settings.PROJECT_NAME, version=settings.VERSION)
@@ -40,6 +40,7 @@ app.add_exception_handler(Exception, generic_exception_handler)
 # Include Routers with /api prefix
 app.include_router(level3_auth.router, prefix=settings.API_V1_STR)
 app.include_router(level4_core.router, prefix=settings.API_V1_STR)
+app.include_router(level5_dashboards.router, prefix=settings.API_V1_STR)
 
 @app.get("/")
 async def read_root():
