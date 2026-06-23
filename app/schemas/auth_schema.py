@@ -19,6 +19,9 @@ class RegisterRequest(BaseModel):
 class SelectRoleRequest(BaseModel):
     chosen_role: str
 
+class AddRoleRequest(BaseModel):
+    role: str
+
 class UserResponse(BaseModel):
     id: str
     email: str

@@ -1,8 +1,8 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.db.session import get_db
-from app.schemas.auth_schema import SelectRoleRequest, TokenResponse, LoginRequest, RegisterRequest, LoginResponse
+from app.schemas.auth_schema import SelectRoleRequest, TokenResponse, LoginRequest, RegisterRequest, LoginResponse, AddRoleRequest
 from app.api.dependencies import get_current_user_id, get_token_payload
 from app.services.auth_service import verify_user_owns_role, get_user_roles
 from app.core.security import create_access_token, verify_password, get_password_hash
@@ -51,7 +51,7 @@ async def register(request: RegisterRequest, db: AsyncSession = Depends(get_db))
 
 
 @router.post("/login", response_model=LoginResponse)
-async def login(request: LoginRequest, db: AsyncSession = Depends(get_db)):
+async def login(request: LoginRequest, response: Response, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(User).where(User.email == request.email))
     user = result.scalar_one_or_none()
     
@@ -69,6 +69,16 @@ async def login(request: LoginRequest, db: AsyncSession = Depends(get_db)):
         expires_delta=access_token_expires
     )
     
+    # Set HttpOnly cookie
+    response.set_cookie(
+        key="access_token",
+        value=access_token,
+        httponly=True,
+        max_age=expire_minutes * 60,
+        samesite="lax",
+        secure=False  # Set to True in production with HTTPS
+    )
+    
     return {
         "access_token": access_token,
         "token_type": "bearer"
@@ -77,6 +87,7 @@ async def login(request: LoginRequest, db: AsyncSession = Depends(get_db)):
 @router.post("/select-role", response_model=TokenResponse)
 async def select_role(
     request: SelectRoleRequest,
+    response: Response,
     payload: dict = Depends(get_token_payload),
     db: AsyncSession = Depends(get_db)
 ):
@@ -96,15 +107,32 @@ async def select_role(
             detail=f"User does not own the role: {request.chosen_role}"
         )
 
-    # Generate a new session token with the active role embedded
-    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    # Note: we need to preserve the expiration of the original token or just set it to 1 day / 30 days again.
+    # For simplicity, assuming 30 days if remember_me was true before, but since we don't have that info in payload unless we store it, 
+    # we'll use a standard active session expiration. Let's use 30 days default to avoid abrupt session loss.
+    access_token_expires = timedelta(minutes=60 * 24 * 30)
     active_role_token = create_access_token(
         user_id=user_id,
         active_role=request.chosen_role,
         expires_delta=access_token_expires
     )
     
+    # Set HttpOnly cookie
+    response.set_cookie(
+        key="access_token",
+        value=active_role_token,
+        httponly=True,
+        max_age=60 * 24 * 30 * 60,
+        samesite="lax",
+        secure=False  # Set to True in production
+    )
+    
     return {"access_token": active_role_token, "token_type": "bearer"}
+
+@router.post("/logout")
+async def logout(response: Response):
+    response.delete_cookie("access_token")
+    return {"message": "Logged out successfully"}
 
 @router.get("/roles", response_model=list[str])
 async def get_available_roles():
@@ -112,3 +140,32 @@ async def get_available_roles():
     Returns all available roles in the SEAPEDIA system.
     """
     return [role.value for role in AppRole]
+
+@router.post("/add-role")
+async def add_role(
+    request: AddRoleRequest,
+    payload: dict = Depends(get_token_payload),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Allows an authenticated user to add a new role to their account.
+    """
+    user_id = payload.get("sub")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid token payload")
+        
+    role_enum = AppRole(request.role.upper())
+    if not role_enum:
+        raise HTTPException(status_code=400, detail=f"Invalid role: {request.role}")
+
+    # Check if user already has the role
+    owns_role = await verify_user_owns_role(db, user_id=user_id, role=request.role)
+    if owns_role:
+        return {"message": f"User already has the role: {request.role}"}
+
+    # Add the role
+    user_role = UserRole(user_id=user_id, role=role_enum)
+    db.add(user_role)
+    await db.commit()
+    
+    return {"message": f"Successfully added role: {request.role}"}
