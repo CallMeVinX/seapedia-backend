@@ -13,6 +13,10 @@ class Settings(BaseSettings):
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 8 # 8 days
 
+    # Supabase (for storage)
+    SUPABASE_URL: str = ""
+    SUPABASE_KEY: str = ""
+
     class Config:
         env_file = ".env"
 
