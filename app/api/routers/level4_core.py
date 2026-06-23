@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status
+from typing import Optional
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
 from app.db.session import get_db
 from app.api.dependencies import get_token_payload, RequireActiveRole
@@ -343,11 +344,9 @@ async def checkout(
     if len(selected_items) != len(request.cart_item_ids):
         raise HTTPException(status_code=400, detail="Beberapa barang yang dipilih tidak valid.")
         
-    # 2. Validate Single-Store
+    # 2. Validate Single-Store (Removed as per request)
     store_ids = {item.product.store_id for item in selected_items}
-    if len(store_ids) > 1:
-        raise HTTPException(status_code=400, detail="Checkout Gagal: Anda hanya dapat melakukan checkout barang dari 1 toko dalam satu waktu.")
-        
+    # Just take the first store_id for now as bypass
     store_id = list(store_ids)[0]
     
     # 3. Lock Products for Race Condition (SELECT ... FOR UPDATE)
@@ -425,10 +424,20 @@ async def checkout(
         delivery_fee=delivery_fee,
         ppn_amount=ppn_amount,
         final_total=final_total,
-        current_status="Sedang Dikemas"
+        current_status=OrderStatus.MENUNGGU_PEMBAYARAN.value
     )
     db.add(new_order)
     await db.flush() # To get new_order.id
+    
+    # 7.5 Create Initial Order History
+    history = OrderStatusHistory(
+        order_id=new_order.id,
+        status_name=OrderStatus.MENUNGGU_PEMBAYARAN.value,
+        changed_by_user_id=user_id,
+        changed_by_role="Buyer"
+    )
+    db.add(history)
+    
     
     # 8. Create Order Items
     for item in selected_items:
@@ -456,3 +465,993 @@ async def checkout(
         final_total=final_total,
         message="Checkout berhasil!"
     )
+
+@router.post("/buyer/orders/{order_id}/pay")
+async def pay_order(
+    order_id: int,
+    payload: dict = Depends(RequireActiveRole(["BUYER"])),
+    db: AsyncSession = Depends(get_db)
+):
+    user_id_str = payload.get("sub")
+    user_id = uuid.UUID(user_id_str)
+    
+    # Fetch Order
+    order_res = await db.execute(
+        select(Order)
+        .where(Order.id == order_id, Order.buyer_id == user_id)
+        .with_for_update()
+    )
+    order = order_res.scalar_one_or_none()
+    
+    if not order:
+        raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan.")
+        
+    if order.current_status != OrderStatus.MENUNGGU_PEMBAYARAN.value:
+        raise HTTPException(status_code=400, detail="Pesanan tidak dalam status Menunggu Pembayaran.")
+        
+    # Fetch Wallet
+    from app.models.wallet import Wallet, WalletTransaction
+    wallet_res = await db.execute(
+        select(Wallet)
+        .where(Wallet.buyer_id == user_id)
+        .with_for_update()
+    )
+    wallet = wallet_res.scalar_one_or_none()
+    
+    if not wallet or wallet.balance < order.final_total:
+        raise HTTPException(status_code=400, detail="Saldo dompet tidak mencukupi, silakan Top-Up terlebih dahulu.")
+        
+    # Deduct Wallet
+    wallet.balance -= order.final_total
+    txn = WalletTransaction(
+        wallet_id=wallet.id,
+        amount=-order.final_total,
+        transaction_type="Payment",
+        reference_id=str(order.id),
+        description=f"Pembayaran pesanan #{order.id}"
+    )
+    db.add(txn)
+    
+    # Update Order
+    order.current_status = OrderStatus.SEDANG_DIKEMAS.value
+    
+    history = OrderStatusHistory(
+        order_id=order.id,
+        status_name=OrderStatus.SEDANG_DIKEMAS.value,
+        changed_by_user_id=user_id,
+        changed_by_role="Buyer"
+    )
+    db.add(history)
+    
+    await db.commit()
+    
+    return {"message": "Pembayaran berhasil, pesanan sedang diproses."}
+
+
+
+# --- Order Tracking & Delivery Endpoints ---
+
+from app.schemas.order_schema import OrderStatusUpdateRequest, OrderStatusHistoryResponse, OrderStatus
+from app.models.order import OrderStatusHistory, DeliveryJob
+
+@router.get("/orders/{order_id}/tracking", response_model=list[OrderStatusHistoryResponse])
+async def get_order_tracking(
+    order_id: int,
+    payload: dict = Depends(get_token_payload),
+    db: AsyncSession = Depends(get_db)
+):
+    # Retrieve history
+    result = await db.execute(
+        select(OrderStatusHistory)
+        .where(OrderStatusHistory.order_id == order_id)
+        .order_by(OrderStatusHistory.created_at.asc())
+    )
+    history = result.scalars().all()
+    
+    return [
+        OrderStatusHistoryResponse(
+            id=h.id,
+            status_name=h.status_name,
+            changed_by_user_id=str(h.changed_by_user_id) if h.changed_by_user_id else None,
+            changed_by_role=h.changed_by_role,
+            created_at=h.created_at
+        ) for h in history
+    ]
+
+@router.patch("/orders/{order_id}/status")
+async def update_order_status(
+    order_id: int,
+    request: OrderStatusUpdateRequest,
+    payload: dict = Depends(get_token_payload),
+    db: AsyncSession = Depends(get_db)
+):
+    try:
+        user_id_str = payload.get("sub")
+        if not user_id_str:
+            raise HTTPException(status_code=401, detail="Invalid token payload")
+        user_id = uuid.UUID(user_id_str)
+        active_role = payload.get("active_role")
+        
+        if active_role != "SELLER":
+            raise HTTPException(status_code=403, detail="Hanya Seller yang dapat memproses pesanan melalui endpoint ini")
+            
+        # Get order with lock
+        result = await db.execute(select(Order).where(Order.id == order_id).with_for_update())
+        order = result.scalar_one_or_none()
+        
+        if not order:
+            raise HTTPException(status_code=404, detail="Order not found")
+            
+        # Verify Seller ownership
+        store_result = await db.execute(select(Store).where(Store.seller_id == user_id))
+        store = store_result.scalar_one_or_none()
+        if not store or order.store_id != store.id:
+            raise HTTPException(status_code=403, detail="Anda tidak memiliki akses ke pesanan ini")
+
+        # State transition validation
+        if order.current_status != OrderStatus.SEDANG_DIKEMAS.value:
+            raise HTTPException(status_code=400, detail=f"Pesanan dengan status '{order.current_status}' tidak dapat diproses")
+            
+        if request.status != OrderStatus.MENUNGGU_PENGIRIM.value:
+            raise HTTPException(status_code=400, detail="Seller hanya dapat mengubah status menjadi Menunggu Pengirim")
+            
+        order.current_status = request.status.value
+        
+        history = OrderStatusHistory(
+            order_id=order.id,
+            status_name=request.status.value,
+            changed_by_user_id=user_id,
+            changed_by_role=active_role
+        )
+        db.add(history)
+        await db.commit()
+        
+        return {"message": "Status updated successfully", "new_status": request.status.value}
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/driver/deliveries/{order_id}/take")
+async def take_delivery_job(
+    order_id: int,
+    payload: dict = Depends(RequireActiveRole(["DRIVER", "Driver"])),
+    db: AsyncSession = Depends(get_db)
+):
+    user_id_str = payload.get("sub")
+    user_id = uuid.UUID(user_id_str)
+    
+    # Use explicit FOR UPDATE to avoid race condition
+    result = await db.execute(select(Order).where(Order.id == order_id).with_for_update())
+    order = result.scalar_one_or_none()
+    
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+        
+    if order.current_status != OrderStatus.MENUNGGU_PENGIRIM.value:
+        raise HTTPException(status_code=400, detail="Order is not available for pickup")
+        
+    # Check if a delivery job already exists
+    job_result = await db.execute(select(DeliveryJob).where(DeliveryJob.order_id == order_id))
+    if job_result.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="Job already taken by another driver")
+        
+    # Assign job
+    new_job = DeliveryJob(
+        order_id=order.id,
+        driver_id=user_id,
+        driver_earning=order.delivery_fee,
+        status=OrderStatus.SEDANG_DIKIRIM.value
+    )
+    db.add(new_job)
+    
+    # Update order status
+    order.current_status = OrderStatus.SEDANG_DIKIRIM.value
+    
+    # Add history
+    history = OrderStatusHistory(
+        order_id=order.id,
+        status_name=OrderStatus.SEDANG_DIKIRIM.value,
+        changed_by_user_id=user_id,
+        changed_by_role="Driver"
+    )
+    db.add(history)
+    
+    await db.commit()
+    
+    return {"message": "Delivery job taken successfully"}
+
+@router.post("/driver/deliveries/{order_id}/complete")
+async def complete_delivery_job(
+    order_id: int,
+    payload: dict = Depends(RequireActiveRole(["DRIVER", "Driver"])),
+    db: AsyncSession = Depends(get_db)
+):
+    user_id_str = payload.get("sub")
+    user_id = uuid.UUID(user_id_str)
+    
+    # Fetch job and order
+    job_result = await db.execute(select(DeliveryJob).where(DeliveryJob.order_id == order_id).with_for_update())
+    job = job_result.scalar_one_or_none()
+    
+    if not job:
+        raise HTTPException(status_code=404, detail="Delivery job not found")
+        
+    if job.driver_id != user_id:
+        raise HTTPException(status_code=403, detail="You are not authorized to complete this job")
+        
+    order_result = await db.execute(select(Order).where(Order.id == order_id).with_for_update())
+    order = order_result.scalar_one_or_none()
+    
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+        
+    if order.current_status != OrderStatus.SEDANG_DIKIRIM.value:
+        raise HTTPException(status_code=400, detail="Pesanan ini tidak sedang dalam pengiriman")
+
+    from datetime import datetime, timezone
+    job.status = OrderStatus.PESANAN_SELESAI.value
+    job.completed_at = datetime.now(timezone.utc)
+    
+    order.current_status = OrderStatus.PESANAN_SELESAI.value
+    
+    history = OrderStatusHistory(
+        order_id=order.id,
+        status_name=OrderStatus.PESANAN_SELESAI.value,
+        changed_by_user_id=user_id,
+        changed_by_role="Driver"
+    )
+    db.add(history)
+    
+    await db.commit()
+    
+    return {"message": "Delivery job completed successfully"}
+
+from app.schemas.order_schema import OrderResponse, OrderItemResponse
+
+@router.get("/driver/jobs/available", response_model=list[OrderResponse])
+async def get_available_delivery_jobs(
+    payload: dict = Depends(RequireActiveRole(["DRIVER", "Driver"])),
+    db: AsyncSession = Depends(get_db)
+):
+    query = (
+        select(Order)
+        .options(
+            selectinload(Order.store),
+            selectinload(Order.address),
+            selectinload(Order.items).selectinload(OrderItem.product).selectinload(Product.images)
+        )
+        .where(Order.current_status == OrderStatus.MENUNGGU_PENGIRIM.value)
+        .order_by(Order.created_at.asc())
+    )
+    result = await db.execute(query)
+    orders = result.scalars().all()
+    
+    response_list = []
+    for order in orders:
+        items_resp = []
+        for item in order.items:
+            img_url = None
+            if item.product and item.product.images:
+                primary_img = next((img for img in item.product.images if img.is_primary), None)
+                img_url = primary_img.image_url if primary_img else item.product.images[0].image_url
+                
+            items_resp.append(OrderItemResponse(
+                id=item.id,
+                product_id=item.product_id,
+                product_name=item.product.name if item.product else "Unknown Product",
+                quantity=item.quantity,
+                unit_price=item.unit_price_at_purchase,
+                product_image=img_url
+            ))
+            
+        response_list.append(OrderResponse(
+            id=order.id,
+            store_name=order.store.store_name if order.store else "Unknown Store",
+            current_status=order.current_status,
+            final_total=order.final_total,
+            delivery_fee=order.delivery_fee,
+            shipping_address=order.address.full_address if order.address else None,
+            created_at=order.created_at,
+            items=items_resp
+        ))
+    return response_list
+
+@router.get("/driver/jobs/active", response_model=list[OrderResponse])
+async def get_active_delivery_jobs(
+    payload: dict = Depends(RequireActiveRole(["DRIVER", "Driver"])),
+    db: AsyncSession = Depends(get_db)
+):
+    user_id_str = payload.get("sub")
+    user_uuid = uuid.UUID(user_id_str)
+    
+    query = (
+        select(Order)
+        .join(DeliveryJob, Order.id == DeliveryJob.order_id)
+        .options(
+            selectinload(Order.store),
+            selectinload(Order.address),
+            selectinload(Order.items).selectinload(OrderItem.product).selectinload(Product.images)
+        )
+        .where(
+            DeliveryJob.driver_id == user_uuid,
+            DeliveryJob.status == OrderStatus.SEDANG_DIKIRIM.value,
+            Order.current_status == OrderStatus.SEDANG_DIKIRIM.value
+        )
+        .order_by(DeliveryJob.taken_at.desc())
+    )
+    result = await db.execute(query)
+    orders = result.scalars().all()
+    
+    response_list = []
+    for order in orders:
+        items_resp = []
+        for item in order.items:
+            img_url = None
+            if item.product and item.product.images:
+                primary_img = next((img for img in item.product.images if img.is_primary), None)
+                img_url = primary_img.image_url if primary_img else item.product.images[0].image_url
+                
+            items_resp.append(OrderItemResponse(
+                id=item.id,
+                product_id=item.product_id,
+                product_name=item.product.name if item.product else "Unknown Product",
+                quantity=item.quantity,
+                unit_price=item.unit_price_at_purchase,
+                product_image=img_url
+            ))
+            
+        response_list.append(OrderResponse(
+            id=order.id,
+            store_name=order.store.store_name if order.store else "Unknown Store",
+            current_status=order.current_status,
+            final_total=order.final_total,
+            delivery_fee=order.delivery_fee,
+            shipping_address=order.address.full_address if order.address else None,
+            created_at=order.created_at,
+            items=items_resp
+        ))
+    return response_list
+
+@router.get("/driver/earnings")
+async def get_driver_earnings(
+    payload: dict = Depends(RequireActiveRole(["DRIVER", "Driver"])),
+    db: AsyncSession = Depends(get_db)
+):
+    user_id_str = payload.get("sub")
+    user_uuid = uuid.UUID(user_id_str)
+    
+    total = await db.scalar(
+        select(func.sum(DeliveryJob.driver_earning)).where(
+            DeliveryJob.driver_id == user_uuid,
+            DeliveryJob.status == OrderStatus.PESANAN_SELESAI.value
+        )
+    )
+    
+    jobs_result = await db.execute(
+        select(DeliveryJob, Order).join(Order, DeliveryJob.order_id == Order.id)
+        .where(
+            DeliveryJob.driver_id == user_uuid,
+            DeliveryJob.status == OrderStatus.PESANAN_SELESAI.value
+        )
+        .order_by(DeliveryJob.completed_at.desc())
+    )
+    
+    history = []
+    for job, order in jobs_result.all():
+        history.append({
+            "job_id": job.id,
+            "order_id": order.id,
+            "earning": float(job.driver_earning),
+            "completed_at": job.completed_at.isoformat() if job.completed_at else None
+        })
+        
+    return {
+        "total_earnings": float(total) if total else 0,
+        "history": history
+    }
+
+# --- Buyer Endpoints ---
+
+@router.get("/buyer/orders", response_model=list[OrderResponse])
+async def get_buyer_orders(
+    payload: dict = Depends(RequireActiveRole(["BUYER"])),
+    db: AsyncSession = Depends(get_db)
+):
+    user_id_str = payload.get("sub")
+    user_id = uuid.UUID(user_id_str)
+    
+    result = await db.execute(
+        select(Order)
+        .options(
+            selectinload(Order.store),
+            selectinload(Order.items).selectinload(OrderItem.product).selectinload(Product.images)
+        )
+        .where(Order.buyer_id == user_id)
+        .order_by(Order.created_at.desc())
+    )
+    orders = result.scalars().all()
+    
+    response_list = []
+    for order in orders:
+        items_resp = []
+        for item in order.items:
+            img_url = None
+            if item.product and item.product.images:
+                primary_img = next((img for img in item.product.images if img.is_primary), None)
+                img_url = primary_img.image_url if primary_img else item.product.images[0].image_url
+                
+            items_resp.append(OrderItemResponse(
+                id=item.id,
+                product_id=item.product_id,
+                product_name=item.product.name if item.product else "Unknown Product",
+                quantity=item.quantity,
+                unit_price=item.unit_price_at_purchase,
+                product_image=img_url
+            ))
+            
+        response_list.append(OrderResponse(
+            id=order.id,
+            store_name=order.store.store_name if order.store else "Unknown Store",
+            current_status=order.current_status,
+            final_total=order.final_total,
+            delivery_fee=order.delivery_fee,
+            created_at=order.created_at,
+            items=items_resp
+        ))
+        
+    return response_list
+
+@router.get("/buyer/orders/{order_id}", response_model=OrderResponse)
+async def get_buyer_order_detail(
+    order_id: int,
+    payload: dict = Depends(RequireActiveRole(["BUYER"])),
+    db: AsyncSession = Depends(get_db)
+):
+    user_id_str = payload.get("sub")
+    user_id = uuid.UUID(user_id_str)
+    
+    result = await db.execute(
+        select(Order)
+        .options(
+            selectinload(Order.store),
+            selectinload(Order.items).selectinload(OrderItem.product).selectinload(Product.images)
+        )
+        .where(Order.id == order_id, Order.buyer_id == user_id)
+    )
+    order = result.scalar_one_or_none()
+    
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+        
+    items_resp = []
+    for item in order.items:
+        img_url = None
+        if item.product and item.product.images:
+            primary_img = next((img for img in item.product.images if img.is_primary), None)
+            img_url = primary_img.image_url if primary_img else item.product.images[0].image_url
+            
+        items_resp.append(OrderItemResponse(
+            id=item.id,
+            product_id=item.product_id,
+            product_name=item.product.name if item.product else "Unknown Product",
+            quantity=item.quantity,
+            unit_price=item.unit_price_at_purchase,
+            product_image=img_url
+        ))
+        
+    return OrderResponse(
+        id=order.id,
+        store_name=order.store.store_name if order.store else "Unknown Store",
+        current_status=order.current_status,
+        final_total=order.final_total,
+        delivery_fee=order.delivery_fee,
+        created_at=order.created_at,
+        items=items_resp
+    )
+
+@router.post("/buyer/orders/{order_id}/cancel")
+async def cancel_order_buyer(
+    order_id: int,
+    payload: dict = Depends(RequireActiveRole(["BUYER"])),
+    db: AsyncSession = Depends(get_db)
+):
+    user_id_str = payload.get("sub")
+    user_uuid = uuid.UUID(user_id_str)
+    
+    result = await db.execute(
+        select(Order)
+        .where(Order.id == order_id)
+        .options(selectinload(Order.items))
+        .with_for_update()
+    )
+    order = result.scalar_one_or_none()
+    
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+        
+    if order.buyer_id != user_uuid:
+        raise HTTPException(status_code=403, detail="Not your order")
+        
+    from app.schemas.order_schema import OrderStatus
+    if order.current_status not in [OrderStatus.MENUNGGU_PEMBAYARAN.value, OrderStatus.SEDANG_DIKEMAS.value]:
+        raise HTTPException(status_code=400, detail="Pesanan sudah diproses dan tidak dapat dibatalkan")
+        
+    is_paid = (order.current_status == OrderStatus.SEDANG_DIKEMAS.value)
+    order.current_status = OrderStatus.DIBATALKAN.value
+    
+    # Return stock
+    if order.items:
+        product_ids = [item.product_id for item in order.items]
+        prod_result = await db.execute(
+            select(Product).where(Product.id.in_(product_ids)).with_for_update()
+        )
+        products = {p.id: p for p in prod_result.scalars().all()}
+        for item in order.items:
+            prod = products.get(item.product_id)
+            if prod:
+                prod.stock += item.quantity
+                
+    # Refund wallet if paid
+    if is_paid:
+        from app.models.wallet import Wallet, WalletTransaction
+        wallet_res = await db.execute(
+            select(Wallet).where(Wallet.buyer_id == user_uuid).with_for_update()
+        )
+        wallet = wallet_res.scalar_one_or_none()
+        if wallet:
+            wallet.balance += order.final_total
+            txn = WalletTransaction(
+                wallet_id=wallet.id,
+                amount=order.final_total,
+                transaction_type="Refund",
+                reference_id=str(order.id),
+                description=f"Refund pembatalan pesanan #{order.id}"
+            )
+            db.add(txn)
+    
+    # record history
+    history = OrderStatusHistory(
+        order_id=order.id,
+        status_name=OrderStatus.DIBATALKAN.value,
+        changed_by_user_id=user_uuid,
+        changed_by_role="Buyer"
+    )
+    db.add(history)
+    await db.commit()
+    return {"message": "Pesanan berhasil dibatalkan."}
+
+# --- Seller Endpoints ---
+
+from app.schemas.store_schema import StoreCreateRequest, StoreStatusResponse, StoreResponse
+from app.api.dependencies import get_current_user_id
+
+@router.get("/seller/store/status", response_model=StoreStatusResponse)
+async def get_seller_store_status(
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    result = await db.execute(select(Store).where(Store.seller_id == uuid.UUID(user_id)))
+    store = result.scalar_one_or_none()
+    
+    if store:
+        return StoreStatusResponse(has_store=True, store_name=store.store_name, store_id=store.id)
+    return StoreStatusResponse(has_store=False)
+
+@router.post("/seller/store", response_model=StoreResponse, status_code=201)
+async def create_seller_store(
+    request: StoreCreateRequest,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    user_uuid = uuid.UUID(user_id)
+    
+    # Check if user already has a store
+    existing_store = await db.execute(select(Store).where(Store.seller_id == user_uuid))
+    if existing_store.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="Anda sudah memiliki toko.")
+        
+    # Check if store_name is unique
+    existing_name = await db.execute(select(Store).where(Store.store_name == request.store_name))
+    if existing_name.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="Nama toko ini sudah digunakan oleh pengguna lain. Silakan pilih nama lain.")
+        
+    new_store = Store(
+        seller_id=user_uuid,
+        store_name=request.store_name
+    )
+    db.add(new_store)
+    await db.commit()
+    await db.refresh(new_store)
+    
+    return new_store
+
+@router.get("/seller/orders/incoming", response_model=list[OrderResponse])
+async def get_incoming_seller_orders(
+    status: Optional[str] = None,
+    user_id: str = Depends(get_current_user_id),
+    payload: dict = Depends(RequireActiveRole(["SELLER"])),
+    db: AsyncSession = Depends(get_db)
+):
+    user_uuid = uuid.UUID(user_id)
+    
+    # Get user's store
+    store_result = await db.execute(select(Store).where(Store.seller_id == user_uuid))
+    store = store_result.scalar_one_or_none()
+    if not store:
+        raise HTTPException(status_code=404, detail="Toko tidak ditemukan.")
+        
+    query = (
+        select(Order)
+        .options(
+            selectinload(Order.store),
+            selectinload(Order.address),
+            selectinload(Order.items).selectinload(OrderItem.product).selectinload(Product.images)
+        )
+        .where(Order.store_id == store.id)
+    )
+    
+    if status:
+        if status == "Dikembalikan":
+            from app.schemas.order_schema import OrderStatus
+            query = query.where(Order.current_status.in_([OrderStatus.DIKEMBALIKAN.value, OrderStatus.DIBATALKAN.value]))
+        else:
+            query = query.where(Order.current_status == status)
+    else:
+        # Exclude "Menunggu Pembayaran"
+        from app.schemas.order_schema import OrderStatus
+        query = query.where(Order.current_status != OrderStatus.MENUNGGU_PEMBAYARAN.value)
+        
+    result = await db.execute(query.order_by(Order.created_at.desc()))
+    orders = result.scalars().all()
+    
+    response_list = []
+    for order in orders:
+        items_resp = []
+        for item in order.items:
+            img_url = None
+            if item.product and item.product.images:
+                primary_img = next((img for img in item.product.images if img.is_primary), None)
+                img_url = primary_img.image_url if primary_img else item.product.images[0].image_url
+                
+            items_resp.append(OrderItemResponse(
+                id=item.id,
+                product_id=item.product_id,
+                product_name=item.product.name if item.product else "Unknown Product",
+                quantity=item.quantity,
+                unit_price=item.unit_price_at_purchase,
+                product_image=img_url
+            ))
+            
+        response_list.append(OrderResponse(
+            id=order.id,
+            store_name=order.store.store_name if order.store else "Unknown Store",
+            current_status=order.current_status,
+            final_total=order.final_total,
+            delivery_fee=order.delivery_fee,
+            shipping_address=order.address.full_address if order.address else None,
+            created_at=order.created_at,
+            items=items_resp
+        ))
+        
+    return response_list
+
+# --- Seller Product Management Endpoints ---
+
+from app.schemas.seller_schema import ProductCreateRequest, SellerProductResponse, CategoryResponse, ProductUpdateRequest
+from app.models.product import Category, ProductImage
+
+@router.get("/categories", response_model=list[CategoryResponse])
+async def get_categories(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Category).order_by(Category.name))
+    return result.scalars().all()
+
+@router.get("/seller/products", response_model=list[SellerProductResponse])
+async def get_seller_products(
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    user_uuid = uuid.UUID(user_id)
+    store_result = await db.execute(select(Store).where(Store.seller_id == user_uuid))
+    store = store_result.scalar_one_or_none()
+    if not store:
+        raise HTTPException(status_code=404, detail="Toko tidak ditemukan.")
+
+    result = await db.execute(
+        select(Product)
+        .options(selectinload(Product.category), selectinload(Product.images))
+        .where(Product.store_id == store.id)
+        .order_by(Product.created_at.desc())
+    )
+    products = result.scalars().all()
+
+    return [
+        SellerProductResponse(
+            id=p.id,
+            name=p.name,
+            description=p.description,
+            price=p.price,
+            stock=p.stock,
+            category_name=p.category.name if p.category else "Uncategorized",
+            image_url=next((img.image_url for img in p.images if img.is_primary), p.images[0].image_url if p.images else None),
+            is_deleted=p.is_deleted
+        ) for p in products
+    ]
+
+from fastapi import File, UploadFile
+from supabase import create_client, Client
+
+@router.post("/seller/products/image")
+async def upload_product_image(
+    file: UploadFile = File(...),
+    user_id: str = Depends(get_current_user_id)
+):
+    """
+    Upload a product image to Supabase Storage and return the public URL.
+    """
+    if not settings.SUPABASE_URL or not settings.SUPABASE_KEY:
+        raise HTTPException(status_code=500, detail="Supabase is not configured on the backend.")
+        
+    if not file.content_type.startswith('image/'):
+        raise HTTPException(status_code=400, detail="File must be an image")
+        
+    if file.size and file.size > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File too large. Max 5MB")
+
+    # Read file content
+    content = await file.read()
+    
+    # Generate unique filename
+    import uuid
+    import time
+    ext = file.filename.split('.')[-1] if '.' in file.filename else 'jpg'
+    file_name = f"{uuid.uuid4()}_{int(time.time())}.{ext}"
+    
+    try:
+        supabase: Client = create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
+        bucket_name = "product-images"
+        
+        # Upload
+        res = supabase.storage.from_(bucket_name).upload(
+            path=file_name,
+            file=content,
+            file_options={"content-type": file.content_type}
+        )
+        
+        # Get public url
+        public_url = supabase.storage.from_(bucket_name).get_public_url(file_name)
+        
+        return {"url": public_url}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to upload to storage: {str(e)}")
+
+@router.post("/seller/products", response_model=SellerProductResponse, status_code=201)
+async def create_seller_product(
+    request: ProductCreateRequest,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    user_uuid = uuid.UUID(user_id)
+    store_result = await db.execute(select(Store).where(Store.seller_id == user_uuid))
+    store = store_result.scalar_one_or_none()
+    if not store:
+        raise HTTPException(status_code=404, detail="Anda belum memiliki toko.")
+
+    # Validate category exists
+    cat_result = await db.execute(select(Category).where(Category.id == request.category_id))
+    category = cat_result.scalar_one_or_none()
+    if not category:
+        raise HTTPException(status_code=400, detail="Kategori tidak ditemukan.")
+
+    new_product = Product(
+        store_id=store.id,
+        category_id=request.category_id,
+        name=request.name,
+        description=request.description,
+        price=request.price,
+        stock=request.stock
+    )
+    db.add(new_product)
+    await db.flush() # flush to get new_product.id
+    
+    # Save image_url if provided
+    if request.image_url:
+        new_image = ProductImage(
+            product_id=new_product.id,
+            image_url=request.image_url,
+            is_primary=True
+        )
+        db.add(new_image)
+        
+    await db.commit()
+    await db.refresh(new_product)
+    
+    # Explicitly load relationships to return a complete response
+    await db.refresh(new_product, ["category", "images"])
+    return SellerProductResponse(
+        id=new_product.id,
+        name=new_product.name,
+        description=new_product.description,
+        price=new_product.price,
+        stock=new_product.stock,
+        category_name=category.name,
+        image_url=request.image_url,
+        is_deleted=new_product.is_deleted
+    )
+
+@router.put("/seller/products/{product_id}", response_model=SellerProductResponse)
+async def update_seller_product(
+    product_id: int,
+    request: ProductUpdateRequest,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    user_uuid = uuid.UUID(user_id)
+    store_result = await db.execute(select(Store).where(Store.seller_id == user_uuid))
+    store = store_result.scalar_one_or_none()
+    if not store:
+        raise HTTPException(status_code=404, detail="Anda belum memiliki toko.")
+
+    # Get product
+    prod_result = await db.execute(
+        select(Product)
+        .options(selectinload(Product.category), selectinload(Product.images))
+        .where(Product.id == product_id, Product.store_id == store.id, Product.is_deleted == False)
+    )
+    product = prod_result.scalar_one_or_none()
+    if not product:
+        raise HTTPException(status_code=404, detail="Produk tidak ditemukan atau sudah dihapus.")
+
+    # Validate category
+    cat_result = await db.execute(select(Category).where(Category.id == request.category_id))
+    category = cat_result.scalar_one_or_none()
+    if not category:
+        raise HTTPException(status_code=400, detail="Kategori tidak ditemukan.")
+
+    # Update product
+    product.name = request.name
+    product.description = request.description
+    product.price = request.price
+    product.stock = request.stock
+    product.category_id = request.category_id
+
+    await db.commit()
+    await db.refresh(product)
+
+    return SellerProductResponse(
+        id=product.id,
+        name=product.name,
+        description=product.description,
+        price=product.price,
+        stock=product.stock,
+        category_name=category.name,
+        image_url=next((img.image_url for img in product.images if img.is_primary), product.images[0].image_url if product.images else None),
+        is_deleted=product.is_deleted
+    )
+
+@router.delete("/seller/products/{product_id}", status_code=204)
+async def delete_seller_product(
+    product_id: int,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    user_uuid = uuid.UUID(user_id)
+    store_result = await db.execute(select(Store).where(Store.seller_id == user_uuid))
+    store = store_result.scalar_one_or_none()
+    if not store:
+        raise HTTPException(status_code=404, detail="Anda belum memiliki toko.")
+
+    # Get product
+    prod_result = await db.execute(
+        select(Product).where(Product.id == product_id, Product.store_id == store.id, Product.is_deleted == False)
+    )
+    product = prod_result.scalar_one_or_none()
+    if not product:
+        raise HTTPException(status_code=404, detail="Produk tidak ditemukan.")
+
+    # Soft delete
+    product.is_deleted = True
+    await db.commit()
+    return None
+
+# --- Buyer Wallet & Address Endpoints ---
+
+from app.models.wallet import Wallet, WalletTransaction
+from app.schemas.wallet_schema import WalletResponse, WalletTransactionResponse, TopUpRequest
+from app.models.order import BuyerAddress
+
+@router.get("/buyer/wallet", response_model=WalletResponse)
+async def get_buyer_wallet(
+    payload: dict = Depends(RequireActiveRole(["BUYER"])),
+    db: AsyncSession = Depends(get_db)
+):
+    user_id = uuid.UUID(payload.get("sub"))
+    result = await db.execute(
+        select(Wallet)
+        .options(selectinload(Wallet.transactions))
+        .where(Wallet.buyer_id == user_id)
+    )
+    wallet = result.scalar_one_or_none()
+
+    if not wallet:
+        # Auto-create wallet for buyer
+        wallet = Wallet(buyer_id=user_id)
+        db.add(wallet)
+        await db.commit()
+        await db.refresh(wallet)
+        return WalletResponse(id=wallet.id, balance=wallet.balance, transactions=[])
+
+    txns = sorted(wallet.transactions, key=lambda t: t.created_at, reverse=True)[:20]
+    return WalletResponse(
+        id=wallet.id,
+        balance=wallet.balance,
+        transactions=[
+            WalletTransactionResponse(
+                id=t.id, amount=t.amount, transaction_type=t.transaction_type,
+                description=t.description, created_at=t.created_at
+            ) for t in txns
+        ]
+    )
+
+@router.post("/buyer/wallet/topup", response_model=WalletResponse)
+async def topup_buyer_wallet(
+    request: TopUpRequest,
+    payload: dict = Depends(RequireActiveRole(["BUYER"])),
+    db: AsyncSession = Depends(get_db)
+):
+    user_id = uuid.UUID(payload.get("sub"))
+    result = await db.execute(select(Wallet).where(Wallet.buyer_id == user_id))
+    wallet = result.scalar_one_or_none()
+
+    if not wallet:
+        wallet = Wallet(buyer_id=user_id)
+        db.add(wallet)
+        await db.flush()
+
+    wallet.balance += request.amount
+    txn = WalletTransaction(
+        wallet_id=wallet.id,
+        amount=request.amount,
+        transaction_type="TopUp",
+        description=f"Top-up saldo Rp {request.amount:,.0f}"
+    )
+    db.add(txn)
+    await db.commit()
+    await db.refresh(wallet)
+    await db.refresh(txn)
+
+    # Return updated wallet
+    result2 = await db.execute(
+        select(Wallet).options(selectinload(Wallet.transactions)).where(Wallet.id == wallet.id)
+    )
+    wallet = result2.scalar_one()
+    txns = sorted(wallet.transactions, key=lambda t: t.created_at, reverse=True)[:20]
+    return WalletResponse(
+        id=wallet.id,
+        balance=wallet.balance,
+        transactions=[
+            WalletTransactionResponse(
+                id=t.id, amount=t.amount, transaction_type=t.transaction_type,
+                description=t.description, created_at=t.created_at
+            ) for t in txns
+        ]
+    )
+
+@router.delete("/buyer/addresses/{address_id}")
+async def delete_buyer_address(
+    address_id: int,
+    payload: dict = Depends(RequireActiveRole(["BUYER"])),
+    db: AsyncSession = Depends(get_db)
+):
+    user_id = uuid.UUID(payload.get("sub"))
+    result = await db.execute(
+        select(BuyerAddress).where(BuyerAddress.id == address_id, BuyerAddress.buyer_id == user_id)
+    )
+    address = result.scalar_one_or_none()
+    if not address:
+        raise HTTPException(status_code=404, detail="Alamat tidak ditemukan.")
+
+    await db.delete(address)
+    await db.commit()
+    return {"message": "Alamat berhasil dihapus."}
