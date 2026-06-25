@@ -76,6 +76,7 @@ async def list_products(db: AsyncSession = Depends(get_db)):
             "name": product.name,
             "description": product.description,
             "price": product.price,
+            "promo_price": product.promo_price,
             "stock": product.stock,
             "image_url": image_url,
             "images": [img.image_url for img in product.images],
@@ -109,6 +110,7 @@ async def get_product(product_id: int, db: AsyncSession = Depends(get_db)):
         "name": product.name,
         "description": product.description,
         "price": product.price,
+        "promo_price": product.promo_price,
         "stock": product.stock,
         "image_url": image_url,
         "images": [img.image_url for img in product.images],
@@ -225,6 +227,8 @@ async def get_cart(
         
         store_name = item.product.store.store_name if item.product.store else f"Store #{item.product.store_id}"
         
+        effective_price = item.product.promo_price if item.product.promo_price is not None else item.product.price
+
         items_response.append(CartItemResponse(
             id=item.id,
             product_id=item.product.id,
@@ -234,10 +238,11 @@ async def get_cart(
             store_name=store_name,
             quantity=item.quantity,
             unit_price=int(item.product.price),
-            total_price=int(item.product.price * item.quantity)
+            promo_price=int(item.product.promo_price) if item.product.promo_price is not None else None,
+            total_price=int(effective_price * item.quantity)
         ))
         total_items += item.quantity
-        total_price += item.product.price * item.quantity
+        total_price += effective_price * item.quantity
         
     return CartResponse(
         id=cart.id,
@@ -290,6 +295,8 @@ async def add_to_cart(
     
     if existing_item:
         if new_total_quantity <= 0:
+            if existing_item in cart.items:
+                cart.items.remove(existing_item)
             await db.delete(existing_item)
         else:
             existing_item.quantity = new_total_quantity
@@ -302,6 +309,60 @@ async def add_to_cart(
     
     # Fetch full updated cart for response
     return await get_cart(payload=payload, db=db)
+
+from pydantic import BaseModel
+class ValidateDiscountRequest(BaseModel):
+    discount_code: str
+    subtotal: Decimal
+
+class ValidateDiscountResponse(BaseModel):
+    is_valid: bool
+    code: str
+    amount: Decimal
+    message: str
+
+@router.post("/buyer/checkout/validate-discount", response_model=ValidateDiscountResponse)
+async def validate_discount(
+    request: ValidateDiscountRequest,
+    payload: dict = Depends(RequireActiveRole(["BUYER"])),
+    db: AsyncSession = Depends(get_db)
+):
+    if not request.discount_code:
+        raise HTTPException(status_code=400, detail="Kode diskon tidak boleh kosong.")
+        
+    disc_result = await db.execute(
+        select(Discount).where(
+            Discount.code == request.discount_code.strip().upper(),
+            Discount.is_deleted == False
+        )
+    )
+    discount = disc_result.scalar_one_or_none()
+    
+    if not discount:
+        raise HTTPException(status_code=400, detail="Kode diskon tidak valid atau sudah tidak berlaku.")
+        
+    from datetime import datetime, timezone
+    if discount.expiry_date and discount.expiry_date.replace(tzinfo=None) < datetime.utcnow():
+        raise HTTPException(status_code=400, detail="Kode diskon sudah kedaluwarsa.")
+        
+    if discount.remaining_usage is not None and discount.remaining_usage <= 0:
+        raise HTTPException(status_code=400, detail="Kuota pemakaian kode diskon sudah habis.")
+        
+    discount_amount = Decimal('0.00')
+    if discount.discount_type.upper() == 'PROMO':
+        discount_amount = (request.subtotal * discount.amount / Decimal('100')).quantize(Decimal('0.01'))
+    else:
+        discount_amount = discount.amount
+        
+    if discount_amount > request.subtotal:
+        discount_amount = request.subtotal
+        
+    return ValidateDiscountResponse(
+        is_valid=True,
+        code=discount.code,
+        amount=discount_amount,
+        message="Voucher berhasil digunakan."
+    )
 
 @router.post("/buyer/checkout", response_model=CheckoutResponse)
 async def checkout(
@@ -344,9 +405,13 @@ async def checkout(
     if len(selected_items) != len(request.cart_item_ids):
         raise HTTPException(status_code=400, detail="Beberapa barang yang dipilih tidak valid.")
         
-    # 2. Validate Single-Store (Removed as per request)
+    # 2. Validate Single-Store Constraint
     store_ids = {item.product.store_id for item in selected_items}
-    # Just take the first store_id for now as bypass
+    if len(store_ids) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Checkout hanya dapat dilakukan untuk produk dari satu toko. Silakan pilih barang dari toko yang sama."
+        )
     store_id = list(store_ids)[0]
     
     # 3. Lock Products for Race Condition (SELECT ... FOR UPDATE)
@@ -370,21 +435,48 @@ async def checkout(
         # Deduct stock
         locked_product.stock -= item.quantity
         
-        # Calculate subtotal
-        subtotal += locked_product.price * item.quantity
+        # Calculate subtotal using promo_price if available
+        effective_price = locked_product.promo_price if locked_product.promo_price is not None else locked_product.price
+        subtotal += effective_price * item.quantity
         
     # 4. Calculate Discount
     discount_amount = Decimal('0.00')
     discount_id = None
     if request.discount_code:
         disc_result = await db.execute(
-            select(Discount).where(Discount.code == request.discount_code, Discount.is_deleted == False)
+            select(Discount).where(
+                Discount.code == request.discount_code.strip().upper(),
+                Discount.is_deleted == False
+            ).with_for_update()
         )
         discount = disc_result.scalar_one_or_none()
         if not discount:
-            raise HTTPException(status_code=400, detail="Kode diskon tidak valid.")
-        discount_amount = discount.amount
+            raise HTTPException(status_code=400, detail="Kode diskon tidak valid atau sudah tidak berlaku.")
+        
+        # Validate expiry
+        from datetime import datetime, timezone
+        if discount.expiry_date and discount.expiry_date.replace(tzinfo=None) < datetime.utcnow():
+            raise HTTPException(status_code=400, detail="Kode diskon sudah kedaluwarsa.")
+        
+        # Validate remaining usage
+        if discount.remaining_usage is not None and discount.remaining_usage <= 0:
+            raise HTTPException(status_code=400, detail="Kuota pemakaian kode diskon sudah habis.")
+        
+        # Calculate based on discount type
+        if discount.discount_type.upper() == 'PROMO':
+            discount_amount = (subtotal * discount.amount / Decimal('100')).quantize(Decimal('0.01'))
+        else:
+            discount_amount = discount.amount
+        
+        # Cap discount to subtotal
+        if discount_amount > subtotal:
+            discount_amount = subtotal
+        
         discount_id = discount.id
+        
+        # Decrement usage
+        if discount.remaining_usage is not None:
+            discount.remaining_usage -= 1
         
     # 5. Delivery Fee
     req_delivery = request.delivery_method.upper()
@@ -442,11 +534,12 @@ async def checkout(
     # 8. Create Order Items
     for item in selected_items:
         locked_product = products_locked[item.product_id]
+        effective_price = locked_product.promo_price if locked_product.promo_price is not None else locked_product.price
         order_item = OrderItem(
             order_id=new_order.id,
             product_id=item.product_id,
             quantity=item.quantity,
-            unit_price_at_purchase=locked_product.price
+            unit_price_at_purchase=effective_price
         )
         db.add(order_item)
         
@@ -1172,6 +1265,7 @@ async def get_seller_products(
             name=p.name,
             description=p.description,
             price=p.price,
+            promo_price=p.promo_price,
             stock=p.stock,
             category_name=p.category.name if p.category else "Uncategorized",
             image_url=next((img.image_url for img in p.images if img.is_primary), p.images[0].image_url if p.images else None),
@@ -1250,6 +1344,7 @@ async def create_seller_product(
         name=request.name,
         description=request.description,
         price=request.price,
+        promo_price=request.promo_price,
         stock=request.stock
     )
     db.add(new_product)
@@ -1274,6 +1369,7 @@ async def create_seller_product(
         name=new_product.name,
         description=new_product.description,
         price=new_product.price,
+        promo_price=new_product.promo_price,
         stock=new_product.stock,
         category_name=category.name,
         image_url=request.image_url,
@@ -1313,6 +1409,7 @@ async def update_seller_product(
     product.name = request.name
     product.description = request.description
     product.price = request.price
+    product.promo_price = request.promo_price
     product.stock = request.stock
     product.category_id = request.category_id
 
@@ -1324,6 +1421,7 @@ async def update_seller_product(
         name=product.name,
         description=product.description,
         price=product.price,
+        promo_price=product.promo_price,
         stock=product.stock,
         category_name=category.name,
         image_url=next((img.image_url for img in product.images if img.is_primary), product.images[0].image_url if product.images else None),
