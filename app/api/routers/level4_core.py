@@ -11,7 +11,8 @@ from app.models.product import Product, Store
 from app.models.review import ApplicationReview
 from app.models.cart import Cart, CartItem
 from app.models.order import Order, OrderItem
-from app.models.discount import Discount
+from app.models.promo import Promo, PromoProduct
+from app.models.voucher import Voucher
 
 from app.schemas.auth_schema import UserProfileResponse
 from app.schemas.product_schema import ProductResponse
@@ -19,6 +20,8 @@ from app.schemas.review_schema import ReviewCreateRequest, ReviewResponse
 from app.schemas.order_schema import CheckoutRequest, CheckoutResponse
 from app.schemas.cart_schema import CartItemRequest, CartItemResponse, CartResponse
 from app.schemas.address_schema import AddressRequest, AddressResponse
+from app.schemas.promo_schema import PromoCreateRequest, PromoResponse, PromoUpdateRequest
+from app.schemas.voucher_schema import VoucherCreateRequest, VoucherResponse, VoucherUpdateRequest, ValidateVoucherRequest, ValidateVoucherResponse
 from decimal import Decimal
 import uuid
 
@@ -310,56 +313,52 @@ async def add_to_cart(
     # Fetch full updated cart for response
     return await get_cart(payload=payload, db=db)
 
-from pydantic import BaseModel
-class ValidateDiscountRequest(BaseModel):
-    discount_code: str
-    subtotal: Decimal
-
-class ValidateDiscountResponse(BaseModel):
-    is_valid: bool
-    code: str
-    amount: Decimal
-    message: str
-
-@router.post("/buyer/checkout/validate-discount", response_model=ValidateDiscountResponse)
-async def validate_discount(
-    request: ValidateDiscountRequest,
+@router.post("/buyer/checkout/validate-voucher", response_model=ValidateVoucherResponse)
+async def validate_voucher(
+    request: ValidateVoucherRequest,
     payload: dict = Depends(RequireActiveRole(["BUYER"])),
     db: AsyncSession = Depends(get_db)
 ):
-    if not request.discount_code:
-        raise HTTPException(status_code=400, detail="Kode diskon tidak boleh kosong.")
+    if not request.voucher_code:
+        raise HTTPException(status_code=400, detail="Kode voucher tidak boleh kosong.")
         
-    disc_result = await db.execute(
-        select(Discount).where(
-            Discount.code == request.discount_code.strip().upper(),
-            Discount.is_deleted == False
+    voucher_result = await db.execute(
+        select(Voucher).where(
+            Voucher.code == request.voucher_code.strip().upper(),
+            Voucher.is_deleted == False
         )
     )
-    discount = disc_result.scalar_one_or_none()
+    voucher = voucher_result.scalar_one_or_none()
     
-    if not discount:
-        raise HTTPException(status_code=400, detail="Kode diskon tidak valid atau sudah tidak berlaku.")
+    if not voucher:
+        raise HTTPException(status_code=400, detail="Kode voucher tidak valid atau sudah tidak berlaku.")
         
     from datetime import datetime, timezone
-    if discount.expiry_date and discount.expiry_date.replace(tzinfo=None) < datetime.utcnow():
-        raise HTTPException(status_code=400, detail="Kode diskon sudah kedaluwarsa.")
+    if voucher.valid_until and voucher.valid_until.replace(tzinfo=None) < datetime.utcnow():
+        raise HTTPException(status_code=400, detail="Kode voucher sudah kedaluwarsa.")
+    if voucher.valid_from and voucher.valid_from.replace(tzinfo=None) > datetime.utcnow():
+        raise HTTPException(status_code=400, detail="Kode voucher belum mulai berlaku.")
         
-    if discount.remaining_usage is not None and discount.remaining_usage <= 0:
-        raise HTTPException(status_code=400, detail="Kuota pemakaian kode diskon sudah habis.")
+    if voucher.remaining_usage is not None and voucher.remaining_usage <= 0:
+        raise HTTPException(status_code=400, detail="Kuota pemakaian kode voucher sudah habis.")
         
+    if request.subtotal < voucher.min_purchase:
+         raise HTTPException(status_code=400, detail=f"Minimal belanja untuk voucher ini adalah Rp {voucher.min_purchase}")
+
     discount_amount = Decimal('0.00')
-    if discount.discount_type.upper() == 'PROMO':
-        discount_amount = (request.subtotal * discount.amount / Decimal('100')).quantize(Decimal('0.01'))
+    if voucher.discount_type.upper() == 'PERCENTAGE':
+        discount_amount = (request.subtotal * voucher.amount / Decimal('100')).quantize(Decimal('0.01'))
+        if voucher.max_discount and discount_amount > voucher.max_discount:
+             discount_amount = voucher.max_discount
     else:
-        discount_amount = discount.amount
+        discount_amount = voucher.amount
         
     if discount_amount > request.subtotal:
         discount_amount = request.subtotal
         
-    return ValidateDiscountResponse(
+    return ValidateVoucherResponse(
         is_valid=True,
-        code=discount.code,
+        code=voucher.code,
         amount=discount_amount,
         message="Voucher berhasil digunakan."
     )
@@ -418,13 +417,22 @@ async def checkout(
     product_ids = [item.product_id for item in selected_items]
     prod_result = await db.execute(
         select(Product)
+        .options(selectinload(Product.promo_products).selectinload(PromoProduct.promo))
         .where(Product.id.in_(product_ids))
         .with_for_update()
     )
     products_locked = {p.id: p for p in prod_result.scalars().all()}
     
     subtotal = Decimal('0.00')
+    promo_discount_amount = Decimal('0.00')
+    promo_id = None # Assuming we just take the first promo found for logging if needed, or we might need a mapping. Since Order currently has only one promo_id, we will store the last used promo_id or null if multiple.
     
+    from datetime import datetime, timezone
+    now = datetime.utcnow()
+
+    # To track the applied prices
+    item_applied_prices = {}
+
     for item in selected_items:
         locked_product = products_locked.get(item.product_id)
         if not locked_product:
@@ -435,48 +443,70 @@ async def checkout(
         # Deduct stock
         locked_product.stock -= item.quantity
         
-        # Calculate subtotal using promo_price if available
-        effective_price = locked_product.promo_price if locked_product.promo_price is not None else locked_product.price
-        subtotal += effective_price * item.quantity
+        base_price = locked_product.price
+        subtotal += base_price * item.quantity
         
-    # 4. Calculate Discount
-    discount_amount = Decimal('0.00')
-    discount_id = None
-    if request.discount_code:
-        disc_result = await db.execute(
-            select(Discount).where(
-                Discount.code == request.discount_code.strip().upper(),
-                Discount.is_deleted == False
+        # Calculate promo
+        item_promo_discount = Decimal('0.00')
+        if locked_product.promo_products:
+            for pp in locked_product.promo_products:
+                promo = pp.promo
+                if promo.is_active and promo.valid_from.replace(tzinfo=None) <= now <= promo.valid_until.replace(tzinfo=None):
+                    # Found an active promo
+                    item_promo_discount = (base_price * promo.discount_percentage / Decimal('100')).quantize(Decimal('0.01'))
+                    promo_id = promo.id # Just store the last applied promo ID for the order
+                    break
+                    
+        promo_discount_amount += item_promo_discount * item.quantity
+        item_applied_prices[item.product_id] = base_price - item_promo_discount
+        
+    # 4. Calculate Voucher Discount
+    voucher_discount_amount = Decimal('0.00')
+    voucher_id = None
+    subtotal_after_promo = subtotal - promo_discount_amount
+    
+    if request.voucher_code:
+        voucher_result = await db.execute(
+            select(Voucher).where(
+                Voucher.code == request.voucher_code.strip().upper(),
+                Voucher.is_deleted == False
             ).with_for_update()
         )
-        discount = disc_result.scalar_one_or_none()
-        if not discount:
-            raise HTTPException(status_code=400, detail="Kode diskon tidak valid atau sudah tidak berlaku.")
+        voucher = voucher_result.scalar_one_or_none()
+        if not voucher:
+            raise HTTPException(status_code=400, detail="Kode voucher tidak valid atau sudah tidak berlaku.")
         
         # Validate expiry
-        from datetime import datetime, timezone
-        if discount.expiry_date and discount.expiry_date.replace(tzinfo=None) < datetime.utcnow():
-            raise HTTPException(status_code=400, detail="Kode diskon sudah kedaluwarsa.")
+        if voucher.valid_until and voucher.valid_until.replace(tzinfo=None) < now:
+            raise HTTPException(status_code=400, detail="Kode voucher sudah kedaluwarsa.")
+        if voucher.valid_from and voucher.valid_from.replace(tzinfo=None) > now:
+            raise HTTPException(status_code=400, detail="Kode voucher belum mulai berlaku.")
+            
+        # Validate minimum purchase against subtotal AFTER promo
+        if subtotal_after_promo < voucher.min_purchase:
+             raise HTTPException(status_code=400, detail=f"Minimal belanja untuk voucher ini adalah Rp {voucher.min_purchase}")
         
         # Validate remaining usage
-        if discount.remaining_usage is not None and discount.remaining_usage <= 0:
-            raise HTTPException(status_code=400, detail="Kuota pemakaian kode diskon sudah habis.")
+        if voucher.remaining_usage is not None and voucher.remaining_usage <= 0:
+            raise HTTPException(status_code=400, detail="Kuota pemakaian kode voucher sudah habis.")
         
         # Calculate based on discount type
-        if discount.discount_type.upper() == 'PROMO':
-            discount_amount = (subtotal * discount.amount / Decimal('100')).quantize(Decimal('0.01'))
+        if voucher.discount_type.upper() == 'PERCENTAGE':
+            voucher_discount_amount = (subtotal_after_promo * voucher.amount / Decimal('100')).quantize(Decimal('0.01'))
+            if voucher.max_discount and voucher_discount_amount > voucher.max_discount:
+                 voucher_discount_amount = voucher.max_discount
         else:
-            discount_amount = discount.amount
+            voucher_discount_amount = voucher.amount
         
-        # Cap discount to subtotal
-        if discount_amount > subtotal:
-            discount_amount = subtotal
+        # Cap discount to subtotal after promo
+        if voucher_discount_amount > subtotal_after_promo:
+            voucher_discount_amount = subtotal_after_promo
         
-        discount_id = discount.id
+        voucher_id = voucher.id
         
         # Decrement usage
-        if discount.remaining_usage is not None:
-            discount.remaining_usage -= 1
+        if voucher.remaining_usage is not None:
+            voucher.remaining_usage -= 1
         
     # 5. Delivery Fee
     req_delivery = request.delivery_method.upper()
@@ -496,11 +526,11 @@ async def checkout(
     db_delivery_method = db_delivery_mapping.get(req_delivery, "Regular")
     
     # 6. PPN 12%
-    ppn_amount = ((subtotal - discount_amount) * Decimal('0.12')).quantize(Decimal('0.01'))
+    ppn_amount = ((subtotal - promo_discount_amount - voucher_discount_amount) * Decimal('0.12')).quantize(Decimal('0.01'))
     if ppn_amount < 0:
         ppn_amount = Decimal('0.00')
         
-    final_total = subtotal - discount_amount + delivery_fee + ppn_amount
+    final_total = subtotal - promo_discount_amount - voucher_discount_amount + delivery_fee + ppn_amount
     if final_total < 0:
         final_total = Decimal('0.00')
         
@@ -509,10 +539,12 @@ async def checkout(
         buyer_id=user_id,
         store_id=store_id,
         address_id=request.address_id,
-        discount_id=discount_id,
+        promo_id=promo_id,
+        voucher_id=voucher_id,
         delivery_method=db_delivery_method,
         subtotal=subtotal,
-        discount_amount=discount_amount,
+        promo_discount_amount=promo_discount_amount,
+        voucher_discount_amount=voucher_discount_amount,
         delivery_fee=delivery_fee,
         ppn_amount=ppn_amount,
         final_total=final_total,
@@ -533,8 +565,7 @@ async def checkout(
     
     # 8. Create Order Items
     for item in selected_items:
-        locked_product = products_locked[item.product_id]
-        effective_price = locked_product.promo_price if locked_product.promo_price is not None else locked_product.price
+        effective_price = item_applied_prices[item.product_id]
         order_item = OrderItem(
             order_id=new_order.id,
             product_id=item.product_id,
@@ -552,7 +583,8 @@ async def checkout(
     return CheckoutResponse(
         order_id=new_order.id,
         subtotal=subtotal,
-        discount_amount=discount_amount,
+        promo_discount_amount=promo_discount_amount,
+        voucher_discount_amount=voucher_discount_amount,
         delivery_fee=delivery_fee,
         ppn_amount=ppn_amount,
         final_total=final_total,
@@ -1553,3 +1585,117 @@ async def delete_buyer_address(
     await db.delete(address)
     await db.commit()
     return {"message": "Alamat berhasil dihapus."}
+
+
+# ==========================================
+# PROMO ENDPOINTS (SELLER)
+# ==========================================
+
+@router.post("/seller/promos", response_model=PromoResponse)
+async def create_promo(
+    request: PromoCreateRequest,
+    payload: dict = Depends(RequireActiveRole(["SELLER"])),
+    db: AsyncSession = Depends(get_db)
+):
+    user_id_str = payload.get("sub")
+    
+    # Verify seller store
+    store_res = await db.execute(select(Store).where(Store.seller_id == uuid.UUID(user_id_str)))
+    store = store_res.scalar_one_or_none()
+    if not store:
+        raise HTTPException(status_code=400, detail="Anda belum memiliki toko.")
+        
+    # Verify products belong to store
+    prod_res = await db.execute(
+        select(Product).where(Product.id.in_(request.product_ids), Product.store_id == store.id)
+    )
+    products = prod_res.scalars().all()
+    if len(products) != len(request.product_ids):
+        raise HTTPException(status_code=400, detail="Beberapa produk tidak ditemukan atau bukan milik toko Anda.")
+        
+    new_promo = Promo(
+        store_id=store.id,
+        name=request.name,
+        discount_percentage=request.discount_percentage,
+        valid_from=request.valid_from,
+        valid_until=request.valid_until,
+        is_active=True
+    )
+    db.add(new_promo)
+    await db.flush()
+    
+    for pid in request.product_ids:
+        db.add(PromoProduct(promo_id=new_promo.id, product_id=pid))
+        
+    await db.commit()
+    await db.refresh(new_promo)
+    
+    resp = PromoResponse.model_validate(new_promo)
+    resp.product_ids = request.product_ids
+    return resp
+
+@router.get("/seller/promos", response_model=list[PromoResponse])
+async def get_promos(
+    payload: dict = Depends(RequireActiveRole(["SELLER"])),
+    db: AsyncSession = Depends(get_db)
+):
+    user_id_str = payload.get("sub")
+    store_res = await db.execute(select(Store).where(Store.seller_id == uuid.UUID(user_id_str)))
+    store = store_res.scalar_one_or_none()
+    if not store:
+        return []
+        
+    result = await db.execute(
+        select(Promo)
+        .options(selectinload(Promo.promo_products))
+        .where(Promo.store_id == store.id)
+        .order_by(Promo.created_at.desc())
+    )
+    promos = result.scalars().all()
+    
+    responses = []
+    for p in promos:
+        resp = PromoResponse.model_validate(p)
+        resp.product_ids = [pp.product_id for pp in p.promo_products]
+        responses.append(resp)
+    return responses
+
+# ==========================================
+# VOUCHER ENDPOINTS (ADMIN)
+# ==========================================
+
+@router.post("/admin/vouchers", response_model=VoucherResponse)
+async def create_voucher(
+    request: VoucherCreateRequest,
+    payload: dict = Depends(RequireActiveRole(["ADMIN"])),
+    db: AsyncSession = Depends(get_db)
+):
+    # Check if code exists
+    existing = await db.execute(select(Voucher).where(Voucher.code == request.code.strip().upper()))
+    if existing.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="Kode voucher sudah ada.")
+        
+    new_voucher = Voucher(
+        code=request.code.strip().upper(),
+        discount_type=request.discount_type,
+        amount=request.amount,
+        min_purchase=request.min_purchase,
+        max_discount=request.max_discount,
+        remaining_usage=request.remaining_usage,
+        valid_from=request.valid_from,
+        valid_until=request.valid_until
+    )
+    db.add(new_voucher)
+    await db.commit()
+    await db.refresh(new_voucher)
+    return new_voucher
+
+@router.get("/admin/vouchers", response_model=list[VoucherResponse])
+async def get_vouchers(
+    payload: dict = Depends(RequireActiveRole(["ADMIN"])),
+    db: AsyncSession = Depends(get_db)
+):
+    result = await db.execute(
+        select(Voucher).where(Voucher.is_deleted == False).order_by(Voucher.created_at.desc())
+    )
+    return result.scalars().all()
