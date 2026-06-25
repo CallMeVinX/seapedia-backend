@@ -14,6 +14,7 @@ class CartItemResponse(BaseModel):
     store_name: str
     quantity: int
     unit_price: int
+    promo_price: int | None = None
     total_price: int
 
 class CartResponse(BaseModel):

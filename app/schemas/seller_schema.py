@@ -6,6 +6,7 @@ class ProductCreateRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=255, description="Nama produk")
     description: Optional[str] = None
     price: Decimal = Field(..., ge=0, description="Harga harus >= 0")
+    promo_price: Optional[Decimal] = Field(None, ge=0, description="Harga promo opsional")
     stock: int = Field(..., ge=0, description="Stok harus >= 0")
     category_id: int = Field(..., description="ID Kategori produk")
     image_url: Optional[str] = Field(None, description="URL gambar produk dari Supabase Storage")
@@ -14,6 +15,7 @@ class ProductUpdateRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=255, description="Nama produk")
     description: Optional[str] = None
     price: Decimal = Field(..., ge=0, description="Harga harus >= 0")
+    promo_price: Optional[Decimal] = Field(None, ge=0, description="Harga promo opsional")
     stock: int = Field(..., ge=0, description="Stok harus >= 0")
     category_id: int = Field(..., description="ID Kategori produk")
 
@@ -22,6 +24,7 @@ class SellerProductResponse(BaseModel):
     name: str
     description: Optional[str] = None
     price: Decimal
+    promo_price: Optional[Decimal] = None
     stock: int
     category_name: str
     image_url: Optional[str] = None

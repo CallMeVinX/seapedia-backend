@@ -36,6 +36,7 @@ class Product(Base):
     name = Column(String(255), nullable=False)
     description = Column(Text)
     price = Column(Numeric(12, 2), nullable=False)
+    promo_price = Column(Numeric(12, 2), nullable=True)
     stock = Column(Integer, nullable=False)
     is_deleted = Column(Boolean, nullable=False, server_default=text("FALSE"))
     created_at = Column(DateTime(timezone=True), server_default=text("now()"), nullable=False)

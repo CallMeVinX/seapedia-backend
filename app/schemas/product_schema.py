@@ -7,6 +7,7 @@ class ProductResponse(BaseModel):
     name: str
     description: Optional[str] = None
     price: Decimal
+    promo_price: Optional[Decimal] = None
     stock: int
     image_url: Optional[str] = None
     images: list[str] = []
