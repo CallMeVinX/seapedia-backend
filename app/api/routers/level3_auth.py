@@ -69,14 +69,17 @@ async def login(request: LoginRequest, response: Response, db: AsyncSession = De
         expires_delta=access_token_expires
     )
     
+    # Determine cookie settings based on environment
+    is_prod = settings.ENVIRONMENT == "production"
+    
     # Set HttpOnly cookie
     response.set_cookie(
         key="access_token",
         value=access_token,
         httponly=True,
         max_age=expire_minutes * 60,
-        samesite="lax",
-        secure=False  # Set to True in production with HTTPS
+        samesite="none" if is_prod else "lax",
+        secure=is_prod
     )
     
     return {
@@ -117,21 +120,29 @@ async def select_role(
         expires_delta=access_token_expires
     )
     
+    # Determine cookie settings based on environment
+    is_prod = settings.ENVIRONMENT == "production"
+    
     # Set HttpOnly cookie
     response.set_cookie(
         key="access_token",
         value=active_role_token,
         httponly=True,
         max_age=60 * 24 * 30 * 60,
-        samesite="lax",
-        secure=False  # Set to True in production
+        samesite="none" if is_prod else "lax",
+        secure=is_prod
     )
     
     return {"access_token": active_role_token, "token_type": "bearer"}
 
 @router.post("/logout")
 async def logout(response: Response):
-    response.delete_cookie("access_token")
+    is_prod = settings.ENVIRONMENT == "production"
+    response.delete_cookie(
+        key="access_token",
+        samesite="none" if is_prod else "lax",
+        secure=is_prod
+    )
     return {"message": "Logged out successfully"}
 
 @router.get("/roles", response_model=list[str])
