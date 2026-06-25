@@ -54,6 +54,7 @@ class Product(Base):
     images = relationship("ProductImage", back_populates="product", cascade="all, delete-orphan")
     cart_items = relationship("CartItem", back_populates="product", cascade="all, delete-orphan")
     order_items = relationship("OrderItem", back_populates="product")
+    promo_products = relationship("PromoProduct", back_populates="product", cascade="all, delete-orphan")
 
 class ProductImage(Base):
     __tablename__ = "product_images"

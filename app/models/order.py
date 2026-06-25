@@ -21,10 +21,12 @@ class Order(Base):
     buyer_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False, index=True)
     store_id = Column(BigInteger, ForeignKey("stores.id", ondelete="RESTRICT"), nullable=False, index=True)
     address_id = Column(BigInteger, ForeignKey("buyer_addresses.id", ondelete="RESTRICT"), nullable=False, index=True)
-    discount_id = Column(BigInteger, ForeignKey("discounts.id", ondelete="SET NULL"), nullable=True, index=True)
+    promo_id = Column(BigInteger, ForeignKey("promos.id", ondelete="SET NULL"), nullable=True, index=True)
+    voucher_id = Column(BigInteger, ForeignKey("vouchers.id", ondelete="SET NULL"), nullable=True, index=True)
     delivery_method = Column(String(20), nullable=False)
     subtotal = Column(Numeric(12, 2), nullable=False)
-    discount_amount = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    promo_discount_amount = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
+    voucher_discount_amount = Column(Numeric(12, 2), nullable=False, server_default=text("0.00"))
     delivery_fee = Column(Numeric(12, 2), nullable=False)
     ppn_amount = Column(Numeric(12, 2), nullable=False)
     final_total = Column(Numeric(12, 2), nullable=False)
@@ -33,7 +35,8 @@ class Order(Base):
 
     __table_args__ = (
         CheckConstraint('subtotal >= 0', name='chk_order_subtotal'),
-        CheckConstraint('discount_amount >= 0', name='chk_order_discount'),
+        CheckConstraint('promo_discount_amount >= 0', name='chk_order_promo_discount'),
+        CheckConstraint('voucher_discount_amount >= 0', name='chk_order_voucher_discount'),
         CheckConstraint('delivery_fee >= 0', name='chk_order_delivery'),
         CheckConstraint('ppn_amount >= 0', name='chk_order_ppn'),
         CheckConstraint('final_total >= 0', name='chk_order_total'),
@@ -43,7 +46,8 @@ class Order(Base):
     buyer = relationship("User", back_populates="orders", foreign_keys=[buyer_id])
     store = relationship("Store", back_populates="orders")
     address = relationship("BuyerAddress", back_populates="orders")
-    discount = relationship("Discount", back_populates="orders")
+    promo = relationship("Promo", back_populates="orders")
+    voucher = relationship("Voucher", back_populates="orders")
     items = relationship("OrderItem", back_populates="order", cascade="all, delete-orphan")
     status_history = relationship("OrderStatusHistory", back_populates="order", cascade="all, delete-orphan")
     delivery_job = relationship("DeliveryJob", back_populates="order", uselist=False)
