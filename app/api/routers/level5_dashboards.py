@@ -5,7 +5,7 @@ from app.db.session import get_db
 from app.api.dependencies import RequireActiveRole, get_current_user_id
 from app.models.user import User
 from app.models.order import Order, DeliveryJob
-from app.models.product import Product
+from app.models.product import Product, Store
 from datetime import datetime
 
 router = APIRouter(tags=["Dashboards"])
