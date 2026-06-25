@@ -6,8 +6,6 @@ from app.api.dependencies import RequireActiveRole, get_current_user_id
 from app.models.user import User
 from app.models.order import Order, DeliveryJob
 from app.models.product import Product
-from app.models.product import Store
-from app.models.discount import Discount
 from datetime import datetime
 
 router = APIRouter(tags=["Dashboards"])
@@ -152,124 +150,6 @@ async def simulate_next_day(
         "simulated_date": now.isoformat(),
         "refunded_orders": refunded_orders
     }
-
-# Admin Discounts
-from typing import Optional
-from pydantic import BaseModel
-from datetime import datetime
-from decimal import Decimal
-
-class DiscountCreateRequest(BaseModel):
-    code: str
-    type: str = "voucher"
-    discount_value: Decimal
-    discount_type: str
-    min_order_value: float = 0
-    max_usage: Optional[int] = None
-    expiry_date: datetime
-
-class DiscountUpdateRequest(BaseModel):
-    code: Optional[str] = None
-    type: Optional[str] = None
-    discount_value: Optional[Decimal] = None
-    discount_type: Optional[str] = None
-    max_usage: Optional[int] = None
-    expiry_date: Optional[datetime] = None
-    is_active: Optional[bool] = None
-
-def format_discount(d: Discount):
-    is_promo = d.discount_type.upper() == "PROMO"
-    return {
-        "id": d.id,
-        "code": d.code,
-        "type": "promo" if is_promo else "voucher",
-        "discount_value": float(d.amount),
-        "discount_type": "percentage" if is_promo else "fixed",
-        "min_order_value": 0,
-        "max_usage": d.remaining_usage,
-        "current_usage": 0,
-        "expiry_date": d.expiry_date.isoformat() if d.expiry_date else None,
-        "is_active": not d.is_deleted,
-        "created_at": datetime.utcnow().isoformat()
-    }
-
-@router.get("/admin/discounts")
-async def get_admin_discounts(
-    type: Optional[str] = None,
-    payload: dict = Depends(RequireActiveRole(["Admin"])),
-    db: AsyncSession = Depends(get_db)
-):
-    query = select(Discount).where(Discount.is_deleted == False)
-    result = await db.execute(query)
-    discounts = result.scalars().all()
-    return [format_discount(d) for d in discounts]
-
-@router.post("/admin/discounts")
-async def create_admin_discount(
-    request: DiscountCreateRequest,
-    payload: dict = Depends(RequireActiveRole(["Admin"])),
-    db: AsyncSession = Depends(get_db)
-):
-    # Check if code already exists
-    existing = await db.scalar(select(Discount).where(Discount.code == request.code.upper()))
-    if existing:
-        raise HTTPException(status_code=400, detail="Kode diskon sudah ada.")
-        
-    db_discount_type = request.type.upper()
-        
-    new_discount = Discount(
-        code=request.code.upper(),
-        discount_type=db_discount_type,
-        amount=request.discount_value,
-        expiry_date=request.expiry_date,
-        remaining_usage=request.max_usage,
-        is_deleted=False
-    )
-    db.add(new_discount)
-    await db.commit()
-    await db.refresh(new_discount)
-    return format_discount(new_discount)
-
-@router.put("/admin/discounts/{discount_id}")
-async def update_admin_discount(
-    discount_id: int,
-    request: DiscountUpdateRequest,
-    payload: dict = Depends(RequireActiveRole(["Admin"])),
-    db: AsyncSession = Depends(get_db)
-):
-    discount = await db.scalar(select(Discount).where(Discount.id == discount_id))
-    if not discount:
-        raise HTTPException(status_code=404, detail="Diskon tidak ditemukan.")
-        
-    if request.code is not None:
-        discount.code = request.code.upper()
-    if request.discount_value is not None:
-        discount.amount = request.discount_value
-    if hasattr(request, 'type') and request.type is not None:
-        discount.discount_type = request.type.upper()
-    if request.max_usage is not None:
-        discount.remaining_usage = request.max_usage
-    if request.expiry_date is not None:
-        discount.expiry_date = request.expiry_date
-    if request.is_active is not None:
-        discount.is_deleted = not request.is_active
-        
-    await db.commit()
-    await db.refresh(discount)
-    return format_discount(discount)
-
-@router.delete("/admin/discounts/{discount_id}")
-async def delete_admin_discount(
-    discount_id: int,
-    payload: dict = Depends(RequireActiveRole(["Admin"])),
-    db: AsyncSession = Depends(get_db)
-):
-    discount = await db.scalar(select(Discount).where(Discount.id == discount_id))
-    if not discount:
-        raise HTTPException(status_code=404, detail="Diskon tidak ditemukan.")
-    discount.is_deleted = True
-    await db.commit()
-    return {"success": True}
 
 # Seller Dashboard
 @router.get("/seller/dashboard/stats")
