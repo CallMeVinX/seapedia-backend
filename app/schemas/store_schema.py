@@ -10,6 +10,11 @@ class StoreStatusResponse(BaseModel):
     has_store: bool
     store_name: Optional[str] = None
     store_id: Optional[int] = None
+    logo_url: Optional[str] = None
+
+class StoreUpdateRequest(BaseModel):
+    store_name: Optional[str] = None
+    logo_url: Optional[str] = None
 
 class StoreResponse(BaseModel):
     id: int

@@ -12,7 +12,7 @@ class BuyerAddress(Base):
 
     # Relationships
     buyer = relationship("User", back_populates="addresses")
-    orders = relationship("Order", back_populates="address")
+    orders = relationship("Order", back_populates="address", passive_deletes="all")
 
 class Order(Base):
     __tablename__ = "orders"

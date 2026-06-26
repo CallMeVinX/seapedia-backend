@@ -12,6 +12,7 @@ class ProductResponse(BaseModel):
     image_url: Optional[str] = None
     images: list[str] = []
     store_name: str
+    store_avatar: Optional[str] = None
     category_name: str
 
     model_config = ConfigDict(from_attributes=True)

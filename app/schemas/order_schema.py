@@ -52,8 +52,12 @@ class OrderResponse(BaseModel):
     id: int
     store_name: str
     current_status: str
-    final_total: Decimal
+    subtotal: Decimal
+    promo_discount_amount: Decimal
+    voucher_discount_amount: Decimal
     delivery_fee: Decimal
+    ppn_amount: Decimal
+    final_total: Decimal
     shipping_address: Optional[str] = None
     created_at: datetime
     items: List[OrderItemResponse]

@@ -18,6 +18,7 @@ class ProductUpdateRequest(BaseModel):
     promo_price: Optional[Decimal] = Field(None, ge=0, description="Harga promo opsional")
     stock: int = Field(..., ge=0, description="Stok harus >= 0")
     category_id: int = Field(..., description="ID Kategori produk")
+    image_url: Optional[str] = Field(None, description="URL gambar produk dari Supabase Storage")
 
 class SellerProductResponse(BaseModel):
     id: int

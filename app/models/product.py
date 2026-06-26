@@ -16,6 +16,7 @@ class Store(Base):
     seller = relationship("User", back_populates="store")
     products = relationship("Product", back_populates="store", cascade="all, delete-orphan")
     orders = relationship("Order", back_populates="store")
+    promos = relationship("Promo", back_populates="store", cascade="all, delete-orphan")
 
 class Category(Base):
     __tablename__ = "categories"

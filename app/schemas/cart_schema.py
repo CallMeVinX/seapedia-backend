@@ -4,6 +4,7 @@ from typing import List
 class CartItemRequest(BaseModel):
     product_id: int
     quantity: int = Field(..., description="Quantity to add or remove (negative to remove)")
+    replace_cart: bool = False
 
 class CartItemResponse(BaseModel):
     id: int

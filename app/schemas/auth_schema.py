@@ -41,8 +41,11 @@ class UserProfileResponse(BaseModel):
     id: str
     email: str
     full_name: str
+    avatar_url: Optional[str] = None
     roles: List[str]
     active_role: Optional[str] = None
     financials: FinancialsResponse
 
-
+class UserProfileUpdateRequest(BaseModel):
+    full_name: Optional[str] = None
+    avatar_url: Optional[str] = None
