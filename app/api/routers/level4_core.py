@@ -14,7 +14,7 @@ from app.models.order import Order, OrderItem
 from app.models.promo import Promo, PromoProduct
 from app.models.voucher import Voucher
 
-from app.schemas.auth_schema import UserProfileResponse
+from app.schemas.auth_schema import UserProfileResponse, UserProfileUpdateRequest
 from app.schemas.product_schema import ProductResponse
 from app.schemas.review_schema import ReviewCreateRequest, ReviewResponse
 from app.schemas.order_schema import CheckoutRequest, CheckoutResponse
@@ -24,6 +24,7 @@ from app.schemas.promo_schema import PromoCreateRequest, PromoResponse, PromoUpd
 from app.schemas.voucher_schema import VoucherCreateRequest, VoucherResponse, VoucherUpdateRequest, ValidateVoucherRequest, ValidateVoucherResponse
 from decimal import Decimal
 import uuid
+from app.core.config import settings
 
 router = APIRouter(tags=["Core App & Marketplace"])
 
@@ -46,6 +47,44 @@ async def get_me(
         "id": str(user.id),
         "email": user.email,
         "full_name": user.full_name,
+        "avatar_url": user.avatar_url,
+        "roles": owned_roles,
+        "active_role": active_role,
+        "financials": {
+            "walletBalance": 0.0,
+            "sellerIncome": 0.0,
+            "driverEarnings": 0.0
+        }
+    }
+
+@router.put("/users/me", response_model=UserProfileResponse)
+async def update_me(
+    request: UserProfileUpdateRequest,
+    payload: dict = Depends(get_token_payload),
+    db: AsyncSession = Depends(get_db)
+):
+    user_id = payload.get("sub")
+    active_role = payload.get("active_role")
+    
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+        
+    if request.full_name is not None:
+        user.full_name = request.full_name
+    if request.avatar_url is not None:
+        user.avatar_url = request.avatar_url
+        
+    await db.commit()
+    
+    owned_roles = await get_user_roles(db, str(user.id))
+    
+    return {
+        "id": str(user.id),
+        "email": user.email,
+        "full_name": user.full_name,
+        "avatar_url": user.avatar_url,
         "roles": owned_roles,
         "active_role": active_role,
         "financials": {
@@ -59,10 +98,18 @@ async def get_me(
 async def list_products(db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         select(Product)
-        .options(selectinload(Product.images), selectinload(Product.store), selectinload(Product.category))
+        .options(
+            selectinload(Product.images), 
+            selectinload(Product.store), 
+            selectinload(Product.category),
+            selectinload(Product.promo_products).selectinload(PromoProduct.promo)
+        )
         .where(Product.is_deleted == False)
     )
     products = result.scalars().all()
+    
+    from datetime import datetime
+    now = datetime.utcnow()
     
     response_list = []
     for product in products:
@@ -74,16 +121,27 @@ async def list_products(db: AsyncSession = Depends(get_db)):
             else:
                 image_url = product.images[0].image_url
                 
+        # Calculate dynamic promo price if active promo exists
+        effective_promo_price = product.promo_price
+        if product.promo_products:
+            for pp in product.promo_products:
+                promo = pp.promo
+                if promo.is_active and promo.valid_from.replace(tzinfo=None) <= now <= promo.valid_until.replace(tzinfo=None):
+                    discount = (product.price * promo.discount_percentage / Decimal('100')).quantize(Decimal('0.01'))
+                    effective_promo_price = product.price - discount
+                    break
+                
         response_list.append({
             "id": product.id,
             "name": product.name,
             "description": product.description,
             "price": product.price,
-            "promo_price": product.promo_price,
+            "promo_price": effective_promo_price,
             "stock": product.stock,
             "image_url": image_url,
             "images": [img.image_url for img in product.images],
             "store_name": product.store.store_name if product.store else "SEAPEDIA Store",
+            "store_avatar": product.store.logo_url if product.store else None,
             "category_name": product.category.name if product.category else "Unknown"
         })
         
@@ -93,7 +151,12 @@ async def list_products(db: AsyncSession = Depends(get_db)):
 async def get_product(product_id: int, db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         select(Product)
-        .options(selectinload(Product.images), selectinload(Product.store), selectinload(Product.category))
+        .options(
+            selectinload(Product.images), 
+            selectinload(Product.store), 
+            selectinload(Product.category),
+            selectinload(Product.promo_products).selectinload(PromoProduct.promo)
+        )
         .where(Product.id == product_id, Product.is_deleted == False)
     )
     product = result.scalar_one_or_none()
@@ -108,16 +171,29 @@ async def get_product(product_id: int, db: AsyncSession = Depends(get_db)):
         else:
             image_url = product.images[0].image_url
             
+    from datetime import datetime
+    now = datetime.utcnow()
+    
+    effective_promo_price = product.promo_price
+    if product.promo_products:
+        for pp in product.promo_products:
+            promo = pp.promo
+            if promo.is_active and promo.valid_from.replace(tzinfo=None) <= now <= promo.valid_until.replace(tzinfo=None):
+                discount = (product.price * promo.discount_percentage / Decimal('100')).quantize(Decimal('0.01'))
+                effective_promo_price = product.price - discount
+                break
+            
     return {
         "id": product.id,
         "name": product.name,
         "description": product.description,
         "price": product.price,
-        "promo_price": product.promo_price,
+        "promo_price": effective_promo_price,
         "stock": product.stock,
         "image_url": image_url,
         "images": [img.image_url for img in product.images],
         "store_name": product.store.store_name if product.store else "SEAPEDIA Store",
+        "store_avatar": product.store.logo_url if product.store else None,
         "category_name": product.category.name if product.category else "Unknown"
     }
 
@@ -206,7 +282,11 @@ async def get_cart(
             .selectinload(Product.images),
             selectinload(Cart.items)
             .selectinload(CartItem.product)
-            .selectinload(Product.store)
+            .selectinload(Product.store),
+            selectinload(Cart.items)
+            .selectinload(CartItem.product)
+            .selectinload(Product.promo_products)
+            .selectinload(PromoProduct.promo)
         )
         .where(Cart.buyer_id == user_id)
     )
@@ -219,6 +299,9 @@ async def get_cart(
     total_items = 0
     total_price = Decimal('0.00')
     
+    from datetime import datetime
+    now = datetime.utcnow()
+    
     for item in cart.items:
         image_url = None
         if item.product.images:
@@ -230,7 +313,16 @@ async def get_cart(
         
         store_name = item.product.store.store_name if item.product.store else f"Store #{item.product.store_id}"
         
-        effective_price = item.product.promo_price if item.product.promo_price is not None else item.product.price
+        effective_promo_price = item.product.promo_price
+        if item.product.promo_products:
+            for pp in item.product.promo_products:
+                promo = pp.promo
+                if promo.is_active and promo.valid_from.replace(tzinfo=None) <= now <= promo.valid_until.replace(tzinfo=None):
+                    discount = (item.product.price * promo.discount_percentage / Decimal('100')).quantize(Decimal('0.01'))
+                    effective_promo_price = item.product.price - discount
+                    break
+        
+        effective_price = effective_promo_price if effective_promo_price is not None else item.product.price
 
         items_response.append(CartItemResponse(
             id=item.id,
@@ -241,7 +333,7 @@ async def get_cart(
             store_name=store_name,
             quantity=item.quantity,
             unit_price=int(item.product.price),
-            promo_price=int(item.product.promo_price) if item.product.promo_price is not None else None,
+            promo_price=int(effective_promo_price) if effective_promo_price is not None else None,
             total_price=int(effective_price * item.quantity)
         ))
         total_items += item.quantity
@@ -274,7 +366,9 @@ async def add_to_cart(
     # Get or create cart
     result = await db.execute(
         select(Cart)
-        .options(selectinload(Cart.items))
+        .options(
+            selectinload(Cart.items).selectinload(CartItem.product)
+        )
         .where(Cart.buyer_id == user_id)
         .with_for_update()
     )
@@ -288,7 +382,21 @@ async def add_to_cart(
     else:
         cart_items = cart.items
             
-    # Check if item already exists in cart (no single-store constraint)
+    # Check for Single-Store Checkout constraint
+    if cart_items:
+        first_item_store_id = cart_items[0].product.store_id
+        if first_item_store_id != product.store_id:
+            if getattr(request, "replace_cart", False):
+                # Clear existing items
+                for item in cart_items:
+                    await db.delete(item)
+                cart.items = []
+                cart_items = []
+                await db.flush()
+            else:
+                raise HTTPException(status_code=409, detail="CONFLICT_DIFFERENT_STORE")
+
+    # Check if item already exists in cart
     existing_item = next((i for i in cart_items if i.product_id == request.product_id), None)
     
     new_total_quantity = (existing_item.quantity if existing_item else 0) + request.quantity
@@ -313,6 +421,50 @@ async def add_to_cart(
     # Fetch full updated cart for response
     return await get_cart(payload=payload, db=db)
 
+@router.delete("/buyer/cart")
+async def clear_cart(
+    payload: dict = Depends(RequireActiveRole(["BUYER"])),
+    db: AsyncSession = Depends(get_db)
+):
+    user_id_str = payload.get("sub")
+    user_id = uuid.UUID(user_id_str)
+    
+    result = await db.execute(select(Cart).where(Cart.buyer_id == user_id).with_for_update())
+    cart = result.scalar_one_or_none()
+    
+    if cart:
+        from sqlalchemy import delete
+        await db.execute(delete(CartItem).where(CartItem.cart_id == cart.id))
+        await db.commit()
+        
+    return {"message": "Keranjang berhasil dikosongkan."}
+
+@router.delete("/buyer/cart/items/{product_id}")
+async def remove_cart_item(
+    product_id: int,
+    payload: dict = Depends(RequireActiveRole(["BUYER"])),
+    db: AsyncSession = Depends(get_db)
+):
+    user_id_str = payload.get("sub")
+    user_id = uuid.UUID(user_id_str)
+    
+    result = await db.execute(select(Cart).where(Cart.buyer_id == user_id).with_for_update())
+    cart = result.scalar_one_or_none()
+    
+    if not cart:
+        raise HTTPException(status_code=404, detail="Keranjang tidak ditemukan.")
+        
+    item_result = await db.execute(
+        select(CartItem).where(CartItem.cart_id == cart.id, CartItem.product_id == product_id)
+    )
+    item = item_result.scalar_one_or_none()
+    
+    if item:
+        await db.delete(item)
+        await db.commit()
+        
+    return {"message": "Produk berhasil dihapus dari keranjang."}
+
 @router.post("/buyer/checkout/validate-voucher", response_model=ValidateVoucherResponse)
 async def validate_voucher(
     request: ValidateVoucherRequest,
@@ -322,9 +474,10 @@ async def validate_voucher(
     if not request.voucher_code:
         raise HTTPException(status_code=400, detail="Kode voucher tidak boleh kosong.")
         
+    from sqlalchemy import func
     voucher_result = await db.execute(
         select(Voucher).where(
-            Voucher.code == request.voucher_code.strip().upper(),
+            func.upper(Voucher.code) == request.voucher_code.strip().upper(),
             Voucher.is_deleted == False
         )
     )
@@ -511,8 +664,8 @@ async def checkout(
     # 5. Delivery Fee
     req_delivery = request.delivery_method.upper()
     delivery_fees = {
-        "INSTANT": Decimal('20000.00'),
-        "NEXT_DAY": Decimal('15000.00'),
+        "INSTANT": Decimal('50000.00'),
+        "NEXT_DAY": Decimal('30000.00'),
         "REGULAR": Decimal('10000.00')
     }
     
@@ -766,7 +919,7 @@ async def take_delivery_job(
     new_job = DeliveryJob(
         order_id=order.id,
         driver_id=user_id,
-        driver_earning=order.delivery_fee,
+        driver_earning=order.delivery_fee * Decimal('0.8'),
         status=OrderStatus.SEDANG_DIKIRIM.value
     )
     db.add(new_job)
@@ -875,6 +1028,10 @@ async def get_available_delivery_jobs(
             id=order.id,
             store_name=order.store.store_name if order.store else "Unknown Store",
             current_status=order.current_status,
+            subtotal=order.subtotal,
+            promo_discount_amount=order.promo_discount_amount,
+            voucher_discount_amount=order.voucher_discount_amount,
+            ppn_amount=order.ppn_amount,
             final_total=order.final_total,
             delivery_fee=order.delivery_fee,
             shipping_address=order.address.full_address if order.address else None,
@@ -931,6 +1088,10 @@ async def get_active_delivery_jobs(
             id=order.id,
             store_name=order.store.store_name if order.store else "Unknown Store",
             current_status=order.current_status,
+            subtotal=order.subtotal,
+            promo_discount_amount=order.promo_discount_amount,
+            voucher_discount_amount=order.voucher_discount_amount,
+            ppn_amount=order.ppn_amount,
             final_total=order.final_total,
             delivery_fee=order.delivery_fee,
             shipping_address=order.address.full_address if order.address else None,
@@ -1020,6 +1181,10 @@ async def get_buyer_orders(
             id=order.id,
             store_name=order.store.store_name if order.store else "Unknown Store",
             current_status=order.current_status,
+            subtotal=order.subtotal,
+            promo_discount_amount=order.promo_discount_amount,
+            voucher_discount_amount=order.voucher_discount_amount,
+            ppn_amount=order.ppn_amount,
             final_total=order.final_total,
             delivery_fee=order.delivery_fee,
             created_at=order.created_at,
@@ -1070,6 +1235,10 @@ async def get_buyer_order_detail(
         id=order.id,
         store_name=order.store.store_name if order.store else "Unknown Store",
         current_status=order.current_status,
+        subtotal=order.subtotal,
+        promo_discount_amount=order.promo_discount_amount,
+        voucher_discount_amount=order.voucher_discount_amount,
+        ppn_amount=order.ppn_amount,
         final_total=order.final_total,
         delivery_fee=order.delivery_fee,
         created_at=order.created_at,
@@ -1149,7 +1318,7 @@ async def cancel_order_buyer(
 
 # --- Seller Endpoints ---
 
-from app.schemas.store_schema import StoreCreateRequest, StoreStatusResponse, StoreResponse
+from app.schemas.store_schema import StoreCreateRequest, StoreStatusResponse, StoreResponse, StoreUpdateRequest
 from app.api.dependencies import get_current_user_id
 
 @router.get("/seller/store/status", response_model=StoreStatusResponse)
@@ -1161,8 +1330,36 @@ async def get_seller_store_status(
     store = result.scalar_one_or_none()
     
     if store:
-        return StoreStatusResponse(has_store=True, store_name=store.store_name, store_id=store.id)
+        return StoreStatusResponse(has_store=True, store_name=store.store_name, store_id=store.id, logo_url=store.logo_url)
     return StoreStatusResponse(has_store=False)
+
+@router.put("/seller/store", response_model=StoreResponse)
+async def update_seller_store(
+    request: StoreUpdateRequest,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db)
+):
+    user_uuid = uuid.UUID(user_id)
+    
+    result = await db.execute(select(Store).where(Store.seller_id == user_uuid))
+    store = result.scalar_one_or_none()
+    
+    if not store:
+        raise HTTPException(status_code=404, detail="Store not found")
+        
+    if request.store_name is not None:
+        if request.store_name != store.store_name:
+            existing_name = await db.execute(select(Store).where(Store.store_name == request.store_name))
+            if existing_name.scalar_one_or_none():
+                raise HTTPException(status_code=400, detail="Nama toko ini sudah digunakan. Silakan pilih nama lain.")
+        store.store_name = request.store_name
+        
+    if request.logo_url is not None:
+        store.logo_url = request.logo_url
+        
+    await db.commit()
+    await db.refresh(store)
+    return store
 
 @router.post("/seller/store", response_model=StoreResponse, status_code=201)
 async def create_seller_store(
@@ -1253,6 +1450,10 @@ async def get_incoming_seller_orders(
             id=order.id,
             store_name=order.store.store_name if order.store else "Unknown Store",
             current_status=order.current_status,
+            subtotal=order.subtotal,
+            promo_discount_amount=order.promo_discount_amount,
+            voucher_discount_amount=order.voucher_discount_amount,
+            ppn_amount=order.ppn_amount,
             final_total=order.final_total,
             delivery_fee=order.delivery_fee,
             shipping_address=order.address.full_address if order.address else None,
@@ -1285,36 +1486,57 @@ async def get_seller_products(
 
     result = await db.execute(
         select(Product)
-        .options(selectinload(Product.category), selectinload(Product.images))
+        .options(
+            selectinload(Product.category), 
+            selectinload(Product.images),
+            selectinload(Product.promo_products).selectinload(PromoProduct.promo)
+        )
         .where(Product.store_id == store.id)
         .order_by(Product.created_at.desc())
     )
     products = result.scalars().all()
 
-    return [
-        SellerProductResponse(
-            id=p.id,
-            name=p.name,
-            description=p.description,
-            price=p.price,
-            promo_price=p.promo_price,
-            stock=p.stock,
-            category_name=p.category.name if p.category else "Uncategorized",
-            image_url=next((img.image_url for img in p.images if img.is_primary), p.images[0].image_url if p.images else None),
-            is_deleted=p.is_deleted
-        ) for p in products
-    ]
+    from datetime import datetime
+    now = datetime.utcnow()
+    
+    response_list = []
+    for p in products:
+        effective_promo_price = p.promo_price
+        if p.promo_products:
+            for pp in p.promo_products:
+                promo = pp.promo
+                if promo.is_active and promo.valid_from.replace(tzinfo=None) <= now <= promo.valid_until.replace(tzinfo=None):
+                    discount = (p.price * promo.discount_percentage / Decimal('100')).quantize(Decimal('0.01'))
+                    effective_promo_price = p.price - discount
+                    break
+                    
+        response_list.append(
+            SellerProductResponse(
+                id=p.id,
+                name=p.name,
+                description=p.description,
+                price=p.price,
+                promo_price=effective_promo_price,
+                stock=p.stock,
+                category_name=p.category.name if p.category else "Uncategorized",
+                image_url=next((img.image_url for img in p.images if img.is_primary), p.images[0].image_url if p.images else None),
+                is_deleted=p.is_deleted
+            )
+        )
+        
+    return response_list
 
-from fastapi import File, UploadFile
+from fastapi import File, UploadFile, Query
 from supabase import create_client, Client
 
 @router.post("/seller/products/image")
-async def upload_product_image(
+async def upload_image(
     file: UploadFile = File(...),
+    type: str = Query("product", description="Type of image: 'product', 'store', or 'user'"),
     user_id: str = Depends(get_current_user_id)
 ):
     """
-    Upload a product image to Supabase Storage and return the public URL.
+    Upload an image to Supabase Storage and return the public URL.
     """
     if not settings.SUPABASE_URL or not settings.SUPABASE_KEY:
         raise HTTPException(status_code=500, detail="Supabase is not configured on the backend.")
@@ -1324,6 +1546,14 @@ async def upload_product_image(
         
     if file.size and file.size > 5 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="File too large. Max 5MB")
+
+    # Determine bucket based on type
+    if type == "store":
+        bucket_name = "store-avatars"
+    elif type == "user":
+        bucket_name = "avatars"
+    else:
+        bucket_name = "product-images"
 
     # Read file content
     content = await file.read()
@@ -1336,7 +1566,6 @@ async def upload_product_image(
     
     try:
         supabase: Client = create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
-        bucket_name = "product-images"
         
         # Upload
         res = supabase.storage.from_(bucket_name).upload(
@@ -1445,8 +1674,28 @@ async def update_seller_product(
     product.stock = request.stock
     product.category_id = request.category_id
 
+    if request.image_url is not None:
+        if request.image_url == "":
+            for img in product.images:
+                await db.delete(img)
+        else:
+            if product.images:
+                primary_img = next((img for img in product.images if img.is_primary), None)
+                if primary_img:
+                    primary_img.image_url = request.image_url
+                else:
+                    product.images[0].image_url = request.image_url
+            else:
+                from app.models.product import ProductImage
+                new_image = ProductImage(
+                    product_id=product.id,
+                    image_url=request.image_url,
+                    is_primary=True
+                )
+                db.add(new_image)
+
     await db.commit()
-    await db.refresh(product)
+    await db.refresh(product, ["category", "images"])
 
     return SellerProductResponse(
         id=product.id,
@@ -1582,10 +1831,16 @@ async def delete_buyer_address(
     if not address:
         raise HTTPException(status_code=404, detail="Alamat tidak ditemukan.")
 
+    from sqlalchemy.exc import IntegrityError
+    
     await db.delete(address)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail="Alamat tidak dapat dihapus karena sedang digunakan dalam pesanan.")
+    
     return {"message": "Alamat berhasil dihapus."}
-
 
 # ==========================================
 # PROMO ENDPOINTS (SELLER)
@@ -1645,12 +1900,7 @@ async def get_promos(
     if not store:
         return []
         
-    result = await db.execute(
-        select(Promo)
-        .options(selectinload(Promo.promo_products))
-        .where(Promo.store_id == store.id)
-        .order_by(Promo.created_at.desc())
-    )
+    result = await db.execute(select(Promo).options(selectinload(Promo.promo_products)).where(Promo.store_id == store.id).order_by(Promo.created_at.desc()))
     promos = result.scalars().all()
     
     responses = []
@@ -1659,6 +1909,90 @@ async def get_promos(
         resp.product_ids = [pp.product_id for pp in p.promo_products]
         responses.append(resp)
     return responses
+
+@router.put("/seller/promos/{promo_id}", response_model=PromoResponse)
+async def update_promo(
+    promo_id: int,
+    request: PromoUpdateRequest,
+    payload: dict = Depends(RequireActiveRole(["SELLER"])),
+    db: AsyncSession = Depends(get_db)
+):
+    user_id_str = payload.get("sub")
+    store_res = await db.execute(select(Store).where(Store.seller_id == uuid.UUID(user_id_str)))
+    store = store_res.scalar_one_or_none()
+    if not store:
+        raise HTTPException(status_code=400, detail="Anda belum memiliki toko.")
+
+    result = await db.execute(
+        select(Promo).options(selectinload(Promo.promo_products)).where(Promo.id == promo_id, Promo.store_id == store.id)
+    )
+    promo = result.scalar_one_or_none()
+    if not promo:
+        raise HTTPException(status_code=404, detail="Promo tidak ditemukan.")
+
+    if request.name is not None:
+        promo.name = request.name
+    if request.discount_percentage is not None:
+        promo.discount_percentage = request.discount_percentage
+    if request.valid_from is not None:
+        promo.valid_from = request.valid_from
+    if request.valid_until is not None:
+        promo.valid_until = request.valid_until
+    if request.is_active is not None:
+        promo.is_active = request.is_active
+
+    if request.product_ids is not None:
+        # Verify products belong to store
+        prod_res = await db.execute(
+            select(Product).where(Product.id.in_(request.product_ids), Product.store_id == store.id)
+        )
+        products = prod_res.scalars().all()
+        if len(products) != len(request.product_ids):
+            raise HTTPException(status_code=400, detail="Beberapa produk tidak ditemukan atau bukan milik toko Anda.")
+            
+        # Delete old promo products
+        from sqlalchemy import delete
+        await db.execute(delete(PromoProduct).where(PromoProduct.promo_id == promo.id))
+        
+        # Add new promo products
+        for pid in request.product_ids:
+            db.add(PromoProduct(promo_id=promo.id, product_id=pid))
+
+    await db.commit()
+    await db.refresh(promo)
+    
+    # Reload with new promo products
+    result = await db.execute(
+        select(Promo).options(selectinload(Promo.promo_products)).where(Promo.id == promo_id)
+    )
+    promo_updated = result.scalar_one()
+
+    resp = PromoResponse.model_validate(promo_updated)
+    resp.product_ids = [pp.product_id for pp in promo_updated.promo_products]
+    return resp
+
+@router.delete("/seller/promos/{promo_id}")
+async def delete_promo(
+    promo_id: int,
+    payload: dict = Depends(RequireActiveRole(["SELLER"])),
+    db: AsyncSession = Depends(get_db)
+):
+    user_id_str = payload.get("sub")
+    store_res = await db.execute(select(Store).where(Store.seller_id == uuid.UUID(user_id_str)))
+    store = store_res.scalar_one_or_none()
+    if not store:
+        raise HTTPException(status_code=400, detail="Anda belum memiliki toko.")
+        
+    result = await db.execute(
+        select(Promo).where(Promo.id == promo_id, Promo.store_id == store.id)
+    )
+    promo = result.scalar_one_or_none()
+    if not promo:
+        raise HTTPException(status_code=404, detail="Promo tidak ditemukan atau bukan milik Anda.")
+        
+    await db.delete(promo)
+    await db.commit()
+    return {"message": "Promo berhasil dihapus."}
 
 # ==========================================
 # VOUCHER ENDPOINTS (ADMIN)

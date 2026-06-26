@@ -54,12 +54,19 @@ async def get_admin_dashboard_stats(
         "delivery_jobs_count": delivery_jobs_count or 0,
         "overdue_orders_count": overdue_count or 0,
         "recent_orders": recent_orders_data,
-        "simulated_date": datetime.utcnow().isoformat()
+        "simulated_date": datetime.utcnow().isoformat() + "Z"
     }
+
+from pydantic import BaseModel
+
+class SimulateNextDayRequest(BaseModel):
+    days_forward: int = 1
+    hours_forward: int = 0
 
 # Admin Dashboard Simulation — Real Auto-Refund Engine
 @router.post("/admin/simulate-next-day")
 async def simulate_next_day(
+    request: SimulateNextDayRequest,
     payload: dict = Depends(RequireActiveRole(["Admin"])),
     db: AsyncSession = Depends(get_db)
 ):
@@ -68,8 +75,9 @@ async def simulate_next_day(
     from app.schemas.order_schema import OrderStatus
     from app.models.order import OrderStatusHistory, OrderItem
     from app.models.wallet import Wallet, WalletTransaction
+    from app.models.product import Product
     
-    now = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc) + timedelta(days=request.days_forward, hours=request.hours_forward)
     
     # SLA thresholds per delivery method
     sla_hours = {
@@ -78,18 +86,24 @@ async def simulate_next_day(
         "Regular": 96,  # 4 days
     }
     
-    # Find all orders currently "Sedang Dikirim"
+    # Find all active paid orders that haven't been completed or cancelled
+    active_statuses = [
+        OrderStatus.SEDANG_DIKEMAS.value,
+        OrderStatus.MENUNGGU_PENGIRIM.value,
+        OrderStatus.SEDANG_DIKIRIM.value
+    ]
+    
     result = await db.execute(
         select(Order)
         .options(selectinload(Order.items))
-        .where(Order.current_status == OrderStatus.SEDANG_DIKIRIM.value)
+        .where(Order.current_status.in_(active_statuses))
         .with_for_update()
     )
-    in_delivery_orders = result.scalars().all()
+    active_orders = result.scalars().all()
     
     refunded_orders = []
     
-    for order in in_delivery_orders:
+    for order in active_orders:
         # Determine SLA deadline based on delivery method
         max_hours = sla_hours.get(order.delivery_method, 96)
         deadline = order.created_at.replace(tzinfo=timezone.utc) + timedelta(hours=max_hours)
