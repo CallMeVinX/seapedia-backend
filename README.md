@@ -100,6 +100,7 @@ Untuk juri atau tim penilai, berikut adalah alur simulasi lengkap:
 ## ⚠️ Batasan Sistem (Known Limitations) & Future Work
 
 Mengingat aplikasi ini dikembangkan dalam lingkup waktu dan prioritas fitur inti *e-commerce*, terdapat beberapa fitur pendukung yang saat ini belum diimplementasikan:
+- **Cold Start (Render Free Tier):** Backend API di-*deploy* menggunakan layanan gratis dari Render.com. Jika aplikasi tidak diakses selama beberapa waktu, *server* akan masuk ke mode *idle/sleep*. Permintaan pertama setelah *idle* (*cold start*) mungkin membutuhkan waktu sekitar 30-50 detik untuk *loading*. Harap bersabar saat membuka aplikasi untuk pertama kalinya.
 - **Visit Store / Profil Toko Publik:** Halaman khusus untuk melihat informasi dan katalog utuh dari satu toko secara terpisah belum tersedia. Katalog saat ini terpusat di halaman beranda.
 - **Lupa Password (Reset Password):** Alur pemulihan kata sandi via email belum diaktifkan (sementara hanya ada UI). Harap ingat kata sandi Anda atau gunakan akun demo yang tersedia.
 - **Payment Gateway Real-Time:** Simulasi pembayaran saat ini dipotong langsung dari saldo *Wallet* virtual bawaan sistem, belum terintegrasi dengan *payment gateway* pihak ketiga (seperti Midtrans/Stripe).
