@@ -68,6 +68,15 @@ Aplikasi ini diarsiteki dengan lapis keamanan tinggi yang diwajibkan dalam produ
 
 ---
 
+## 🔄 Mekanisme Ganti Peran (Role Switching)
+
+Karena SEAPEDIA menggunakan satu akun untuk banyak peran (Multi-Role), Anda dapat beralih peran (Buyer/Seller/Driver/Admin) kapan saja tanpa perlu login ulang. Antarmuka (UI) untuk mengganti peran akan menyesuaikan dengan perangkat yang Anda gunakan:
+
+- **Desktop / Layar Lebar:** Gunakan tombol **Role Switcher** (menampilkan peran aktif Anda) yang terletak langsung di *Top Navbar* (berada tepat di sebelah kiri nama dan foto profil Anda).
+- **Mobile / Layar Kecil (HP):** Karena keterbatasan ruang pada *Top Navbar*, menu ganti peran dipindahkan ke dalam **Dropdown Profil**. Ketuk foto profil Anda di pojok kanan atas, lalu pilih opsi **"Ganti Peran (Role)"** berikon *Users* yang muncul di dalam menu *dropdown*. *(Catatan: Menu ini otomatis muncul hanya jika akun tersebut memiliki lebih dari 1 peran).*
+
+---
+
 ## 🧪 Panduan Testing (End-to-End)
 
 Untuk juri atau tim penilai, berikut adalah alur simulasi lengkap:
