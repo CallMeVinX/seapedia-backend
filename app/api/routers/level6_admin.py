@@ -12,14 +12,22 @@ from typing import Optional
 router = APIRouter(tags=["Admin Discounts"])
 
 class DiscountCreateRequest(BaseModel):
+    """
+    Schema for creating a new discount.
+    Validates the structure of the incoming request payload to ensure data consistency before hitting the database.
+    """
     code: str
     discount_value: float
-    discount_type: str # "fixed" | "percentage"
+    discount_type: str 
     min_order_value: float
     max_usage: Optional[int] = None
     expiry_date: str
 
 class DiscountUpdateRequest(BaseModel):
+    """
+    Schema for partially updating an existing discount.
+    All fields are optional to allow for patching specific attributes without requiring the full object representation.
+    """
     code: Optional[str] = None
     discount_value: Optional[float] = None
     discount_type: Optional[str] = None
@@ -33,6 +41,10 @@ async def get_discounts(
     payload: dict = Depends(RequireActiveRole(["Admin"])),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Fetches all active vouchers in the system.
+    Filters out logically deleted records to prevent inactive discounts from being displayed in the administrative panel.
+    """
     now = datetime.now(timezone.utc)
     results = []
     
@@ -61,6 +73,10 @@ async def create_discount(
     payload: dict = Depends(RequireActiveRole(["Admin"])),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Creates a new discount voucher.
+    Includes explicit rollback on failure to maintain database integrity against duplicate constraint violations.
+    """
     try:
         valid_until = datetime.fromisoformat(data.expiry_date.replace("Z", "+00:00"))
     except ValueError:
@@ -105,7 +121,10 @@ async def update_discount(
     payload: dict = Depends(RequireActiveRole(["Admin"])),
     db: AsyncSession = Depends(get_db)
 ):
-    # Try updating Voucher first
+    """
+    Updates specific attributes of an existing discount voucher.
+    Applies changes conditionally to avoid overwriting existing properties with null values when partial updates are provided.
+    """
     voucher = await db.scalar(select(Voucher).where(Voucher.id == id, Voucher.is_deleted == False))
     if voucher:
         if data.code is not None:
@@ -132,6 +151,10 @@ async def delete_discount(
     payload: dict = Depends(RequireActiveRole(["Admin"])),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Soft-deletes a discount voucher to maintain historical references in past orders.
+    It marks the voucher as deleted rather than removing the row entirely.
+    """
     voucher = await db.scalar(select(Voucher).where(Voucher.id == id, Voucher.is_deleted == False))
     if voucher:
         voucher.is_deleted = True
