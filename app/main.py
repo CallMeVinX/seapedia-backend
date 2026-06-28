@@ -10,7 +10,6 @@ from app.core.exceptions import http_exception_handler, validation_exception_han
 
 app = FastAPI(title=settings.PROJECT_NAME, version=settings.VERSION)
 
-# CORS middleware configuration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -23,21 +22,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Standard Response Middleware (calculates and injects request process time)
 @app.middleware("http")
 async def add_process_time_header(request, call_next):
+    """
+    Intercepts all incoming HTTP requests to calculate and inject the exact processing time into the response headers.
+    Provides crucial metrics for performance monitoring and latency debugging in production environments.
+    """
     start_time = time.time()
     response = await call_next(request)
     process_time = time.time() - start_time
     response.headers["X-Process-Time"] = str(process_time)
     return response
 
-# Register Global Exception Handlers
 app.add_exception_handler(StarletteHTTPException, http_exception_handler)
 app.add_exception_handler(RequestValidationError, validation_exception_handler)
 app.add_exception_handler(Exception, generic_exception_handler)
 
-# Include Routers with /api prefix
 app.include_router(level3_auth.router, prefix=settings.API_V1_STR)
 app.include_router(level4_core.router, prefix=settings.API_V1_STR)
 app.include_router(level5_dashboards.router, prefix=settings.API_V1_STR)
@@ -45,6 +45,10 @@ app.include_router(level6_admin.router, prefix=settings.API_V1_STR)
 
 @app.get("/")
 async def read_root():
+    """
+    Serves as the primary health check endpoint for the API.
+    Used by load balancers and deployment orchestrators (like Kubernetes) to verify that the backend application is alive and ready to receive traffic.
+    """
     return {"message": "Seapedia Backend is running"}
 
 if __name__ == "__main__":

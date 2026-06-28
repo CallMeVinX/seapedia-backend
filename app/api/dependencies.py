@@ -10,9 +10,12 @@ from app.models.user import User
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
 def get_token_payload(request: Request) -> dict:
+    """
+    Extracts and decodes the JWT from either HTTP cookies or the Authorization header.
+    Essential for stateless authentication, allowing the backend to securely identify users across distributed requests without session storage.
+    """
     token = request.cookies.get("access_token")
     if not token:
-        # Fallback to Authorization header if no cookie is present
         auth = request.headers.get("Authorization")
         if auth and auth.startswith("Bearer "):
             token = auth.split(" ")[1]
@@ -37,12 +40,20 @@ def get_token_payload(request: Request) -> dict:
         )
 
 def get_current_user_id(payload: dict = Depends(get_token_payload)) -> str:
+    """
+    Retrieves the raw user ID directly from the validated token payload.
+    Optimizes performance by avoiding database lookups when only the user's UUID is needed for relational queries (e.g., fetching their wallet).
+    """
     return payload.get("sub")
 
 async def get_current_user(
     user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ) -> User:
+    """
+    Fetches the full User model instance from the database using the authenticated ID.
+    Used exclusively in scenarios where deep user profile data is required beyond the basic fields embedded in the JWT.
+    """
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
     if not user:
@@ -51,7 +62,8 @@ async def get_current_user(
 
 class RequireActiveRole:
     """
-    Dependency generator for strict Active Role verification.
+    Validates that the user's explicitly selected 'active_role' matches the endpoint's required roles.
+    Enforces role segregation in a multi-role system, preventing users with multiple roles (e.g., Buyer and Seller) from performing unauthorized actions under the wrong context.
     """
     def __init__(self, allowed_roles: list[str]):
         self.allowed_roles = allowed_roles

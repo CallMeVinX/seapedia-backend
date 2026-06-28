@@ -6,7 +6,6 @@ connect_args = {}
 if settings.database_url.startswith("sqlite"):
     connect_args = {"check_same_thread": False}
 
-# Add pool_pre_ping for Postgres connection robustness
 engine = create_engine(
     settings.database_url,
     connect_args=connect_args,
@@ -17,6 +16,10 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 def get_db():
+    """
+    Dependency generator that provides an isolated database session per request.
+    Ensures safe resource lifecycle management by automatically closing the session after the request is completed, preventing connection leaks.
+    """
     db = SessionLocal()
     try:
         yield db
