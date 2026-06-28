@@ -14,21 +14,22 @@ router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 @router.post("/register", response_model=dict)
 async def register(request: RegisterRequest, db: AsyncSession = Depends(get_db)):
-    # Check if email exists
+    """
+    Handles new user registration by validating email uniqueness and assigning initial roles.
+    This ensures that each user has at least one role (defaulting to Buyer) to interact with the system.
+    """
     result = await db.execute(select(User).where(User.email == request.email))
     if result.scalar_one_or_none():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email already registered")
         
-    # Create user
     new_user = User(
         email=request.email,
         password_hash=get_password_hash(request.password),
         full_name=request.full_name
     )
     db.add(new_user)
-    await db.flush() # To get the new_user.id
+    await db.flush() 
     
-    # Assign roles
     assigned_roles = []
     if request.roles:
         for r_str in request.roles:
@@ -52,6 +53,10 @@ async def register(request: RegisterRequest, db: AsyncSession = Depends(get_db))
 
 @router.post("/login", response_model=LoginResponse)
 async def login(request: LoginRequest, response: Response, db: AsyncSession = Depends(get_db)):
+    """
+    Authenticates user credentials and issues a base JWT.
+    The initial token intentionally omits the 'active_role' claim to force the client to explicitly select a role before accessing protected resources.
+    """
     result = await db.execute(select(User).where(User.email == request.email))
     user = result.scalar_one_or_none()
     
@@ -61,18 +66,15 @@ async def login(request: LoginRequest, response: Response, db: AsyncSession = De
             detail="Incorrect email or password",
         )
     
-    # Generate initial token WITHOUT active_role
-    expire_minutes = 60 * 24 * 30 if request.remember_me else 60 * 24 * 1 # 30 days or 1 day
+    expire_minutes = 60 * 24 * 30 if request.remember_me else 60 * 24 * 1 
     access_token_expires = timedelta(minutes=expire_minutes)
     access_token = create_access_token(
         user_id=str(user.id),
         expires_delta=access_token_expires
     )
     
-    # Determine cookie settings based on environment
     is_prod = settings.ENVIRONMENT == "production"
     
-    # Set HttpOnly cookie
     response.set_cookie(
         key="access_token",
         value=access_token,
@@ -95,14 +97,13 @@ async def select_role(
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Allows a user to select an active role for their session.
-    Returns a new JWT with the explicit `active_role` injected.
+    Allows users to select an active role for their session.
+    This issues a new JWT explicitly including the 'active_role', which is required by the authorization middleware.
     """
     user_id = payload.get("sub")
     if not user_id:
         raise HTTPException(status_code=401, detail="Invalid token payload")
         
-    # Verify user actually owns the chosen role
     owns_role = await verify_user_owns_role(db, user_id=user_id, role=request.chosen_role)
     if not owns_role:
         raise HTTPException(
@@ -110,9 +111,6 @@ async def select_role(
             detail=f"User does not own the role: {request.chosen_role}"
         )
 
-    # Note: we need to preserve the expiration of the original token or just set it to 1 day / 30 days again.
-    # For simplicity, assuming 30 days if remember_me was true before, but since we don't have that info in payload unless we store it, 
-    # we'll use a standard active session expiration. Let's use 30 days default to avoid abrupt session loss.
     access_token_expires = timedelta(minutes=60 * 24 * 30)
     active_role_token = create_access_token(
         user_id=user_id,
@@ -120,10 +118,8 @@ async def select_role(
         expires_delta=access_token_expires
     )
     
-    # Determine cookie settings based on environment
     is_prod = settings.ENVIRONMENT == "production"
     
-    # Set HttpOnly cookie
     response.set_cookie(
         key="access_token",
         value=active_role_token,
@@ -137,6 +133,9 @@ async def select_role(
 
 @router.post("/logout")
 async def logout(response: Response):
+    """
+    Terminates the current session by clearing the access token cookie (HttpOnly).
+    """
     is_prod = settings.ENVIRONMENT == "production"
     response.delete_cookie(
         key="access_token",
@@ -148,7 +147,8 @@ async def logout(response: Response):
 @router.get("/roles", response_model=list[str])
 async def get_available_roles():
     """
-    Returns all available roles in the SEAPEDIA system.
+    Retrieves all available roles in the system.
+    This endpoint is used by the client to dynamically render role selection options.
     """
     return [role.value for role in AppRole]
 
@@ -159,7 +159,8 @@ async def add_role(
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Allows an authenticated user to add a new role to their account.
+    Grants an additional role to the authenticated user.
+    This allows a seamless transition between personas (e.g., Buyer becoming a Seller) without requiring multiple accounts.
     """
     user_id = payload.get("sub")
     if not user_id:
@@ -169,12 +170,10 @@ async def add_role(
     if not role_enum:
         raise HTTPException(status_code=400, detail=f"Invalid role: {request.role}")
 
-    # Check if user already has the role
     owns_role = await verify_user_owns_role(db, user_id=user_id, role=request.role)
     if owns_role:
         return {"message": f"User already has the role: {request.role}"}
 
-    # Add the role
     user_role = UserRole(user_id=user_id, role=role_enum)
     db.add(user_role)
     await db.commit()
