@@ -10,12 +10,15 @@ from datetime import datetime
 
 router = APIRouter(tags=["Dashboards"])
 
-# Admin Dashboard
 @router.get("/admin/dashboard/stats")
 async def get_admin_dashboard_stats(
     payload: dict = Depends(RequireActiveRole(["Admin"])),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Aggregates platform-wide statistics for the admin dashboard.
+    Provides a high-level overview of system metrics and recent transaction activities to monitor overall platform health.
+    """
     users_count = await db.scalar(select(func.count(User.id)))
     stores_count = await db.scalar(select(func.count(Store.id)))
     products_count = await db.scalar(select(func.count(Product.id)))
@@ -63,13 +66,16 @@ class SimulateNextDayRequest(BaseModel):
     days_forward: int = 1
     hours_forward: int = 0
 
-# Admin Dashboard Simulation — Real Auto-Refund Engine
 @router.post("/admin/simulate-next-day")
 async def simulate_next_day(
     request: SimulateNextDayRequest,
     payload: dict = Depends(RequireActiveRole(["Admin"])),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Simulates time progression to test background processes like SLA breaches and auto-refunds.
+    This endpoint allows admins to artificially advance the system clock, triggering overdue checks and refund workflows without waiting for real time to elapse.
+    """
     from datetime import timedelta, timezone
     from sqlalchemy.orm import selectinload
     from app.schemas.order_schema import OrderStatus
@@ -79,14 +85,12 @@ async def simulate_next_day(
     
     now = datetime.now(timezone.utc) + timedelta(days=request.days_forward, hours=request.hours_forward)
     
-    # SLA thresholds per delivery method
     sla_hours = {
         "Instant": 4,
         "Next Day": 24,
-        "Regular": 96,  # 4 days
+        "Regular": 96,
     }
     
-    # Find all active paid orders that haven't been completed or cancelled
     active_statuses = [
         OrderStatus.SEDANG_DIKEMAS.value,
         OrderStatus.MENUNGGU_PENGIRIM.value,
@@ -104,16 +108,12 @@ async def simulate_next_day(
     refunded_orders = []
     
     for order in active_orders:
-        # Determine SLA deadline based on delivery method
         max_hours = sla_hours.get(order.delivery_method, 96)
         deadline = order.created_at.replace(tzinfo=timezone.utc) + timedelta(hours=max_hours)
         
         if now < deadline:
-            continue  # Not overdue yet
+            continue
         
-        # === This order is OVERDUE — process auto-refund ===
-        
-        # 1. Update order status to "Dikembalikan"
         order.current_status = OrderStatus.DIKEMBALIKAN.value
         
         history = OrderStatusHistory(
@@ -123,7 +123,6 @@ async def simulate_next_day(
         )
         db.add(history)
         
-        # 2. Restore product stock
         if order.items:
             product_ids = [item.product_id for item in order.items]
             prod_result = await db.execute(
@@ -135,7 +134,6 @@ async def simulate_next_day(
                 if prod:
                     prod.stock += item.quantity
         
-        # 3. Refund buyer wallet
         wallet_result = await db.execute(
             select(Wallet).where(Wallet.buyer_id == order.buyer_id).with_for_update()
         )
@@ -165,14 +163,16 @@ async def simulate_next_day(
         "refunded_orders": refunded_orders
     }
 
-# Seller Dashboard
 @router.get("/seller/dashboard/stats")
 async def get_seller_dashboard_stats(
     payload: dict = Depends(RequireActiveRole(["Seller"])),
     user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
-    # Get Seller Store
+    """
+    Compiles operational metrics specifically scoped to a seller's store.
+    Provides actionable insights such as pending orders and low stock alerts to help sellers manage their daily operations effectively.
+    """
     store = await db.scalar(select(Store).where(Store.seller_id == user_id))
     if not store:
         return {
@@ -183,10 +183,8 @@ async def get_seller_dashboard_stats(
             "orders_queue": []
         }
     
-    # Action Center Counts
     from app.schemas.order_schema import OrderStatus
     
-    # Total Sales (Only completed orders)
     total_sales = await db.scalar(
         select(func.sum(Order.final_total)).where(
             Order.store_id == store.id,
@@ -216,7 +214,6 @@ async def get_seller_dashboard_stats(
         )
     )
     
-    # Chart Data (Last 7 Days)
     from datetime import timedelta, timezone
     from sqlalchemy import cast, Date
     
@@ -242,7 +239,6 @@ async def get_seller_dashboard_stats(
             "revenue": float(row.revenue)
         })
         
-    # Low Stock Products (Max 5)
     low_stock_result = await db.execute(
         select(Product)
         .where(Product.store_id == store.id, Product.stock <= 5, Product.is_deleted == False)
@@ -258,7 +254,6 @@ async def get_seller_dashboard_stats(
         } for p in low_stock_result.scalars().all()
     ]
     
-    # Recent Orders (Queue) - showing latest 10
     orders_result = await db.execute(
         select(Order).where(Order.store_id == store.id).order_by(Order.created_at.desc()).limit(10)
     )
@@ -282,13 +277,15 @@ async def get_seller_dashboard_stats(
         ]
     }
 
-# Driver Dashboard
 @router.get("/driver/jobs/available")
 async def get_driver_available_jobs(
     payload: dict = Depends(RequireActiveRole(["Driver"])),
     db: AsyncSession = Depends(get_db)
 ):
-    # Find orders that need a driver
+    """
+    Retrieves unassigned delivery jobs by cross-referencing orders against the DeliveryJob table.
+    This acts as a queue for drivers to claim new deliveries based on current order statuses.
+    """
     orders_result = await db.execute(
         select(Order)
         .outerjoin(DeliveryJob, Order.id == DeliveryJob.order_id)
