@@ -33,6 +33,10 @@ async def get_me(
     payload: dict = Depends(get_token_payload),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Retrieves the current authenticated user's profile information.
+    This endpoint fetches not only basic user data but also all owned roles and financial summaries, which are essential for rendering the correct UI features on the client side.
+    """
     user_id = payload.get("sub")
     active_role = payload.get("active_role")
     
@@ -63,6 +67,10 @@ async def update_me(
     payload: dict = Depends(get_token_payload),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Updates the authenticated user's profile details.
+    Allows partial updates (like name or avatar) and subsequently returns the full refreshed profile to keep the client state synchronized.
+    """
     user_id = payload.get("sub")
     active_role = payload.get("active_role")
     
@@ -96,6 +104,10 @@ async def update_me(
 
 @router.get("/products", response_model=list[ProductResponse])
 async def list_products(db: AsyncSession = Depends(get_db)):
+    """
+    Fetches the public catalog of active products.
+    Eagerly loads related entities (images, store, category, promos) to optimize database queries and dynamically calculates the effective promotional price on the fly.
+    """
     result = await db.execute(
         select(Product)
         .options(
@@ -121,7 +133,6 @@ async def list_products(db: AsyncSession = Depends(get_db)):
             else:
                 image_url = product.images[0].image_url
                 
-        # Calculate dynamic promo price if active promo exists
         effective_promo_price = product.promo_price
         if product.promo_products:
             for pp in product.promo_products:
@@ -149,6 +160,10 @@ async def list_products(db: AsyncSession = Depends(get_db)):
 
 @router.get("/products/{product_id}", response_model=ProductResponse)
 async def get_product(product_id: int, db: AsyncSession = Depends(get_db)):
+    """
+    Retrieves detailed information for a single product.
+    Functions similarly to the list endpoint by eagerly loading relations and computing real-time active promotional discounts.
+    """
     result = await db.execute(
         select(Product)
         .options(
@@ -199,6 +214,10 @@ async def get_product(product_id: int, db: AsyncSession = Depends(get_db)):
 
 @router.post("/reviews", response_model=dict)
 async def create_review(request: ReviewCreateRequest, db: AsyncSession = Depends(get_db)):
+    """
+    Submits a new application review.
+    Captures user feedback directly into the database to allow administrators to monitor application sentiment and track improvement requests over time.
+    """
     new_review = ApplicationReview(
         reviewer_name=request.reviewer_name,
         rating=request.rating,
@@ -210,6 +229,10 @@ async def create_review(request: ReviewCreateRequest, db: AsyncSession = Depends
 
 @router.get("/reviews", response_model=list[ReviewResponse])
 async def list_reviews(db: AsyncSession = Depends(get_db)):
+    """
+    Retrieves all application reviews ordered by the most recent first.
+    This public endpoint allows the landing page to dynamically display user testimonials and foster trust among prospective users.
+    """
     result = await db.execute(select(ApplicationReview).order_by(ApplicationReview.created_at.desc()))
     reviews = result.scalars().all()
     
@@ -229,6 +252,10 @@ async def list_addresses(
     payload: dict = Depends(RequireActiveRole(["BUYER"])),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Fetches the saved delivery addresses for the currently authenticated buyer.
+    Required during the checkout process so users can select a destination without re-entering their physical address each time.
+    """
     user_id_str = payload.get("sub")
     user_id = uuid.UUID(user_id_str)
     
@@ -251,6 +278,10 @@ async def add_address(
     payload: dict = Depends(RequireActiveRole(["BUYER"])),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Saves a new delivery address for the buyer.
+    Maintains a one-to-many relationship where a single buyer can manage multiple shipping destinations (e.g., Home, Office).
+    """
     user_id_str = payload.get("sub")
     user_id = uuid.UUID(user_id_str)
     
@@ -271,6 +302,10 @@ async def get_cart(
     payload: dict = Depends(RequireActiveRole(["BUYER"])),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Retrieves the buyer's active shopping cart and its current contents.
+    Aggregates product details, applies valid promotional discounts dynamically, and calculates the total payable amount to present a ready-to-checkout summary.
+    """
     user_id_str = payload.get("sub")
     user_id = uuid.UUID(user_id_str)
     
@@ -353,17 +388,19 @@ async def add_to_cart(
     payload: dict = Depends(RequireActiveRole(["BUYER"])),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Adds a product to the buyer's cart or updates the quantity if it already exists.
+    Enforces a 'Single-Store Checkout' constraint, meaning a cart cannot contain items from multiple different stores simultaneously.
+    If the requested quantity exceeds stock, it blocks the addition to prevent overselling.
+    """
     user_id_str = payload.get("sub")
     user_id = uuid.UUID(user_id_str)
     
-    # Verify product exists
     prod_result = await db.execute(select(Product).where(Product.id == request.product_id, Product.is_deleted == False))
     product = prod_result.scalar_one_or_none()
     if not product:
         raise HTTPException(status_code=404, detail="Produk tidak ditemukan.")
     
-    # (Old stock check removed as it's handled below)
-    # Get or create cart
     result = await db.execute(
         select(Cart)
         .options(
@@ -382,12 +419,10 @@ async def add_to_cart(
     else:
         cart_items = cart.items
             
-    # Check for Single-Store Checkout constraint
     if cart_items:
         first_item_store_id = cart_items[0].product.store_id
         if first_item_store_id != product.store_id:
             if getattr(request, "replace_cart", False):
-                # Clear existing items
                 for item in cart_items:
                     await db.delete(item)
                 cart.items = []
@@ -396,7 +431,6 @@ async def add_to_cart(
             else:
                 raise HTTPException(status_code=409, detail="CONFLICT_DIFFERENT_STORE")
 
-    # Check if item already exists in cart
     existing_item = next((i for i in cart_items if i.product_id == request.product_id), None)
     
     new_total_quantity = (existing_item.quantity if existing_item else 0) + request.quantity
@@ -418,7 +452,6 @@ async def add_to_cart(
         
     await db.commit()
     
-    # Fetch full updated cart for response
     return await get_cart(payload=payload, db=db)
 
 @router.delete("/buyer/cart")
@@ -426,6 +459,10 @@ async def clear_cart(
     payload: dict = Depends(RequireActiveRole(["BUYER"])),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Empties the entire shopping cart for the buyer.
+    Used when a user explicitly wants to start over, or automatically invoked after a successful checkout process.
+    """
     user_id_str = payload.get("sub")
     user_id = uuid.UUID(user_id_str)
     
@@ -445,6 +482,10 @@ async def remove_cart_item(
     payload: dict = Depends(RequireActiveRole(["BUYER"])),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Removes a specific product from the shopping cart.
+    Targets a single line item without affecting other products the buyer intends to purchase.
+    """
     user_id_str = payload.get("sub")
     user_id = uuid.UUID(user_id_str)
     
@@ -471,6 +512,10 @@ async def validate_voucher(
     payload: dict = Depends(RequireActiveRole(["BUYER"])),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Validates a voucher code against the current cart subtotal before finalizing checkout.
+    Checks for expiry, minimum purchase requirements, and remaining usage limits to ensure the discount is mathematically and logically valid.
+    """
     if not request.voucher_code:
         raise HTTPException(status_code=400, detail="Kode voucher tidak boleh kosong.")
         
@@ -522,13 +567,16 @@ async def checkout(
     payload: dict = Depends(RequireActiveRole(["BUYER"])),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Processes the final checkout logic by transforming selected cart items into a formal order.
+    Handles complex business rules including race-condition prevention (using FOR UPDATE locks), dynamic promo/voucher stacking, delivery fee calculation, and 12% PPN taxation.
+    """
     user_id_str = payload.get("sub")
     user_id = uuid.UUID(user_id_str)
     
     if not request.cart_item_ids:
         raise HTTPException(status_code=400, detail="Tidak ada barang yang dipilih untuk dicheckout.")
         
-    # 1. Fetch Cart
     result = await db.execute(
         select(Cart)
         .options(selectinload(Cart.items).selectinload(CartItem.product))
@@ -539,25 +587,21 @@ async def checkout(
     if not cart or not cart.items:
         raise HTTPException(status_code=400, detail="Keranjang kosong.")
         
-    # Verify Address exists
     from app.models.order import BuyerAddress
     addr_res = await db.execute(select(BuyerAddress).where(BuyerAddress.id == request.address_id, BuyerAddress.buyer_id == user_id))
     address = addr_res.scalar_one_or_none()
     if not address:
-        # Auto-create dummy address to prevent foreign key violation if frontend hardcoded 1
         dummy_address = BuyerAddress(buyer_id=user_id, full_address="Alamat Default Otomatis")
         db.add(dummy_address)
         await db.flush()
         request.address_id = dummy_address.id
         
-    # Filter items that are actually in the request
     selected_items = [item for item in cart.items if item.id in request.cart_item_ids]
     if not selected_items:
         raise HTTPException(status_code=400, detail="Barang yang dipilih tidak ditemukan di keranjang.")
     if len(selected_items) != len(request.cart_item_ids):
         raise HTTPException(status_code=400, detail="Beberapa barang yang dipilih tidak valid.")
         
-    # 2. Validate Single-Store Constraint
     store_ids = {item.product.store_id for item in selected_items}
     if len(store_ids) > 1:
         raise HTTPException(
@@ -566,7 +610,6 @@ async def checkout(
         )
     store_id = list(store_ids)[0]
     
-    # 3. Lock Products for Race Condition (SELECT ... FOR UPDATE)
     product_ids = [item.product_id for item in selected_items]
     prod_result = await db.execute(
         select(Product)
@@ -578,12 +621,11 @@ async def checkout(
     
     subtotal = Decimal('0.00')
     promo_discount_amount = Decimal('0.00')
-    promo_id = None # Assuming we just take the first promo found for logging if needed, or we might need a mapping. Since Order currently has only one promo_id, we will store the last used promo_id or null if multiple.
+    promo_id = None 
     
     from datetime import datetime, timezone
     now = datetime.utcnow()
 
-    # To track the applied prices
     item_applied_prices = {}
 
     for item in selected_items:
@@ -593,27 +635,23 @@ async def checkout(
         if locked_product.stock < item.quantity:
             raise HTTPException(status_code=400, detail=f"Stok tidak cukup untuk {locked_product.name}. Tersisa {locked_product.stock} unit.")
         
-        # Deduct stock
         locked_product.stock -= item.quantity
         
         base_price = locked_product.price
         subtotal += base_price * item.quantity
         
-        # Calculate promo
         item_promo_discount = Decimal('0.00')
         if locked_product.promo_products:
             for pp in locked_product.promo_products:
                 promo = pp.promo
                 if promo.is_active and promo.valid_from.replace(tzinfo=None) <= now <= promo.valid_until.replace(tzinfo=None):
-                    # Found an active promo
                     item_promo_discount = (base_price * promo.discount_percentage / Decimal('100')).quantize(Decimal('0.01'))
-                    promo_id = promo.id # Just store the last applied promo ID for the order
+                    promo_id = promo.id 
                     break
                     
         promo_discount_amount += item_promo_discount * item.quantity
         item_applied_prices[item.product_id] = base_price - item_promo_discount
         
-    # 4. Calculate Voucher Discount
     voucher_discount_amount = Decimal('0.00')
     voucher_id = None
     subtotal_after_promo = subtotal - promo_discount_amount
@@ -629,21 +667,17 @@ async def checkout(
         if not voucher:
             raise HTTPException(status_code=400, detail="Kode voucher tidak valid atau sudah tidak berlaku.")
         
-        # Validate expiry
         if voucher.valid_until and voucher.valid_until.replace(tzinfo=None) < now:
             raise HTTPException(status_code=400, detail="Kode voucher sudah kedaluwarsa.")
         if voucher.valid_from and voucher.valid_from.replace(tzinfo=None) > now:
             raise HTTPException(status_code=400, detail="Kode voucher belum mulai berlaku.")
             
-        # Validate minimum purchase against subtotal AFTER promo
         if subtotal_after_promo < voucher.min_purchase:
              raise HTTPException(status_code=400, detail=f"Minimal belanja untuk voucher ini adalah Rp {voucher.min_purchase}")
         
-        # Validate remaining usage
         if voucher.remaining_usage is not None and voucher.remaining_usage <= 0:
             raise HTTPException(status_code=400, detail="Kuota pemakaian kode voucher sudah habis.")
         
-        # Calculate based on discount type
         if voucher.discount_type.upper() == 'PERCENTAGE':
             voucher_discount_amount = (subtotal_after_promo * voucher.amount / Decimal('100')).quantize(Decimal('0.01'))
             if voucher.max_discount and voucher_discount_amount > voucher.max_discount:
@@ -651,17 +685,13 @@ async def checkout(
         else:
             voucher_discount_amount = voucher.amount
         
-        # Cap discount to subtotal after promo
         if voucher_discount_amount > subtotal_after_promo:
             voucher_discount_amount = subtotal_after_promo
         
         voucher_id = voucher.id
         
-        # Decrement usage
         if voucher.remaining_usage is not None:
             voucher.remaining_usage -= 1
-        
-    # 5. Delivery Fee
     req_delivery = request.delivery_method.upper()
     delivery_fees = {
         "INSTANT": Decimal('50000.00'),
@@ -678,7 +708,6 @@ async def checkout(
     delivery_fee = delivery_fees.get(req_delivery, Decimal('10000.00'))
     db_delivery_method = db_delivery_mapping.get(req_delivery, "Regular")
     
-    # 6. PPN 12%
     ppn_amount = ((subtotal - promo_discount_amount - voucher_discount_amount) * Decimal('0.12')).quantize(Decimal('0.01'))
     if ppn_amount < 0:
         ppn_amount = Decimal('0.00')
@@ -687,7 +716,6 @@ async def checkout(
     if final_total < 0:
         final_total = Decimal('0.00')
         
-    # 7. Create Order
     new_order = Order(
         buyer_id=user_id,
         store_id=store_id,
@@ -704,9 +732,8 @@ async def checkout(
         current_status=OrderStatus.MENUNGGU_PEMBAYARAN.value
     )
     db.add(new_order)
-    await db.flush() # To get new_order.id
+    await db.flush() 
     
-    # 7.5 Create Initial Order History
     history = OrderStatusHistory(
         order_id=new_order.id,
         status_name=OrderStatus.MENUNGGU_PEMBAYARAN.value,
@@ -715,8 +742,6 @@ async def checkout(
     )
     db.add(history)
     
-    
-    # 8. Create Order Items
     for item in selected_items:
         effective_price = item_applied_prices[item.product_id]
         order_item = OrderItem(
@@ -727,7 +752,6 @@ async def checkout(
         )
         db.add(order_item)
         
-    # 9. Clear Selected Cart Items
     for item in selected_items:
         await db.delete(item)
         
@@ -750,10 +774,13 @@ async def pay_order(
     payload: dict = Depends(RequireActiveRole(["BUYER"])),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Simulates a payment deduction from the user's digital wallet.
+    Safeguards against double charging by locking the wallet row during the transaction and verifying order state constraints.
+    """
     user_id_str = payload.get("sub")
     user_id = uuid.UUID(user_id_str)
     
-    # Fetch Order
     order_res = await db.execute(
         select(Order)
         .where(Order.id == order_id, Order.buyer_id == user_id)
@@ -818,7 +845,10 @@ async def get_order_tracking(
     payload: dict = Depends(get_token_payload),
     db: AsyncSession = Depends(get_db)
 ):
-    # Retrieve history
+    """
+    Retrieves the complete chronological status history of a specific order.
+    Essential for transparency, allowing buyers, sellers, and drivers to track the lifecycle of an order from payment to final delivery.
+    """
     result = await db.execute(
         select(OrderStatusHistory)
         .where(OrderStatusHistory.order_id == order_id)
@@ -843,6 +873,10 @@ async def update_order_status(
     payload: dict = Depends(get_token_payload),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Allows a seller to update the status of an order (e.g., from packing to ready-to-ship).
+    Includes strict authorization checks to ensure the seller actually owns the store fulfilling the order and enforces valid state machine transitions.
+    """
     try:
         user_id_str = payload.get("sub")
         if not user_id_str:
@@ -853,20 +887,17 @@ async def update_order_status(
         if active_role != "SELLER":
             raise HTTPException(status_code=403, detail="Hanya Seller yang dapat memproses pesanan melalui endpoint ini")
             
-        # Get order with lock
         result = await db.execute(select(Order).where(Order.id == order_id).with_for_update())
         order = result.scalar_one_or_none()
         
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
             
-        # Verify Seller ownership
         store_result = await db.execute(select(Store).where(Store.seller_id == user_id))
         store = store_result.scalar_one_or_none()
         if not store or order.store_id != store.id:
             raise HTTPException(status_code=403, detail="Anda tidak memiliki akses ke pesanan ini")
 
-        # State transition validation
         if order.current_status != OrderStatus.SEDANG_DIKEMAS.value:
             raise HTTPException(status_code=400, detail=f"Pesanan dengan status '{order.current_status}' tidak dapat diproses")
             
@@ -897,10 +928,13 @@ async def take_delivery_job(
     payload: dict = Depends(RequireActiveRole(["DRIVER", "Driver"])),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Enables a driver to claim an available delivery job.
+    Uses database row-level locking to prevent concurrent requests from allowing two drivers to claim the same order simultaneously.
+    """
     user_id_str = payload.get("sub")
     user_id = uuid.UUID(user_id_str)
     
-    # Use explicit FOR UPDATE to avoid race condition
     result = await db.execute(select(Order).where(Order.id == order_id).with_for_update())
     order = result.scalar_one_or_none()
     
@@ -910,12 +944,10 @@ async def take_delivery_job(
     if order.current_status != OrderStatus.MENUNGGU_PENGIRIM.value:
         raise HTTPException(status_code=400, detail="Order is not available for pickup")
         
-    # Check if a delivery job already exists
     job_result = await db.execute(select(DeliveryJob).where(DeliveryJob.order_id == order_id))
     if job_result.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="Job already taken by another driver")
         
-    # Assign job
     new_job = DeliveryJob(
         order_id=order.id,
         driver_id=user_id,
@@ -924,10 +956,8 @@ async def take_delivery_job(
     )
     db.add(new_job)
     
-    # Update order status
     order.current_status = OrderStatus.SEDANG_DIKIRIM.value
     
-    # Add history
     history = OrderStatusHistory(
         order_id=order.id,
         status_name=OrderStatus.SEDANG_DIKIRIM.value,
@@ -946,10 +976,13 @@ async def complete_delivery_job(
     payload: dict = Depends(RequireActiveRole(["DRIVER", "Driver"])),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Marks a delivery job as successfully completed by the driver.
+    Validates ownership of the job and advances the order status to its final state, effectively terminating the active delivery cycle.
+    """
     user_id_str = payload.get("sub")
     user_id = uuid.UUID(user_id_str)
     
-    # Fetch job and order
     job_result = await db.execute(select(DeliveryJob).where(DeliveryJob.order_id == order_id).with_for_update())
     job = job_result.scalar_one_or_none()
     
@@ -993,6 +1026,10 @@ async def get_available_delivery_jobs(
     payload: dict = Depends(RequireActiveRole(["DRIVER", "Driver"])),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Retrieves a list of pending orders that are ready to be shipped.
+    Provides drivers with the necessary marketplace details (stores, drop-off locations) so they can make informed decisions before accepting a job.
+    """
     query = (
         select(Order)
         .options(
@@ -1105,6 +1142,10 @@ async def get_driver_earnings(
     payload: dict = Depends(RequireActiveRole(["DRIVER", "Driver"])),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Calculates and returns the cumulative earnings for a driver based on completed delivery jobs.
+    Essential for drivers to track their income over time and reconcile their external payouts with platform data.
+    """
     user_id_str = payload.get("sub")
     user_uuid = uuid.UUID(user_id_str)
     
@@ -1145,6 +1186,10 @@ async def get_buyer_orders(
     payload: dict = Depends(RequireActiveRole(["BUYER"])),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Retrieves the complete purchase history for the authenticated buyer.
+    Allows users to monitor ongoing orders and review past transactions to support post-purchase activities like reviewing or repurchasing.
+    """
     user_id_str = payload.get("sub")
     user_id = uuid.UUID(user_id_str)
     
@@ -1199,6 +1244,10 @@ async def get_buyer_order_detail(
     payload: dict = Depends(RequireActiveRole(["BUYER"])),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Fetches the comprehensive details of a specific order, including exact items, pricing breakdowns, and applied discounts.
+    Used by the frontend to render the digital receipt and order tracking summary page.
+    """
     user_id_str = payload.get("sub")
     user_id = uuid.UUID(user_id_str)
     
@@ -1251,6 +1300,10 @@ async def cancel_order_buyer(
     payload: dict = Depends(RequireActiveRole(["BUYER"])),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Allows a buyer to cancel an active order before it is processed by the seller.
+    Handles the complex rollback operations: reverting product stock levels and automatically refunding the payment to the buyer's digital wallet if they already paid.
+    """
     user_id_str = payload.get("sub")
     user_uuid = uuid.UUID(user_id_str)
     
@@ -1275,7 +1328,6 @@ async def cancel_order_buyer(
     is_paid = (order.current_status == OrderStatus.SEDANG_DIKEMAS.value)
     order.current_status = OrderStatus.DIBATALKAN.value
     
-    # Return stock
     if order.items:
         product_ids = [item.product_id for item in order.items]
         prod_result = await db.execute(
@@ -1287,7 +1339,6 @@ async def cancel_order_buyer(
             if prod:
                 prod.stock += item.quantity
                 
-    # Refund wallet if paid
     if is_paid:
         from app.models.wallet import Wallet, WalletTransaction
         wallet_res = await db.execute(
@@ -1305,7 +1356,6 @@ async def cancel_order_buyer(
             )
             db.add(txn)
     
-    # record history
     history = OrderStatusHistory(
         order_id=order.id,
         status_name=OrderStatus.DIBATALKAN.value,
@@ -1326,6 +1376,10 @@ async def get_seller_store_status(
     user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Checks if the currently authenticated user has an active store profile.
+    Critical for routing logic in the frontend to determine whether to show the store dashboard or prompt the user to register their store first.
+    """
     result = await db.execute(select(Store).where(Store.seller_id == uuid.UUID(user_id)))
     store = result.scalar_one_or_none()
     
@@ -1339,6 +1393,10 @@ async def update_seller_store(
     user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Updates the seller's store profile, such as the store name or logo.
+    Ensures brand uniqueness by validating that the newly requested store name is not already claimed by another merchant.
+    """
     user_uuid = uuid.UUID(user_id)
     
     result = await db.execute(select(Store).where(Store.seller_id == user_uuid))
@@ -1367,14 +1425,16 @@ async def create_seller_store(
     user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Creates a new store profile for a seller, establishing their presence in the marketplace.
+    Enforces a strict one-to-one relationship where a user can only own a single store to simplify vendor management.
+    """
     user_uuid = uuid.UUID(user_id)
     
-    # Check if user already has a store
     existing_store = await db.execute(select(Store).where(Store.seller_id == user_uuid))
     if existing_store.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="Anda sudah memiliki toko.")
         
-    # Check if store_name is unique
     existing_name = await db.execute(select(Store).where(Store.store_name == request.store_name))
     if existing_name.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="Nama toko ini sudah digunakan oleh pengguna lain. Silakan pilih nama lain.")
@@ -1396,9 +1456,12 @@ async def get_incoming_seller_orders(
     payload: dict = Depends(RequireActiveRole(["SELLER"])),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Provides a comprehensive list of incoming orders assigned to the seller's store.
+    Equipped with status filtering capabilities to help sellers prioritize fulfillment tasks (e.g., filtering for orders that are waiting to be packed).
+    """
     user_uuid = uuid.UUID(user_id)
     
-    # Get user's store
     store_result = await db.execute(select(Store).where(Store.seller_id == user_uuid))
     store = store_result.scalar_one_or_none()
     if not store:
@@ -1470,6 +1533,10 @@ from app.models.product import Category, ProductImage
 
 @router.get("/categories", response_model=list[CategoryResponse])
 async def get_categories(db: AsyncSession = Depends(get_db)):
+    """
+    Retrieves the global list of product categories available on the platform.
+    Ensures a standardized taxonomy across all stores, making it easier for buyers to navigate and filter the marketplace.
+    """
     result = await db.execute(select(Category).order_by(Category.name))
     return result.scalars().all()
 
@@ -1478,6 +1545,10 @@ async def get_seller_products(
     user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Lists all products belonging to the authenticated seller's store.
+    Provides sellers with a centralized inventory view, calculating active promotional prices dynamically for accurate dashboard reporting.
+    """
     user_uuid = uuid.UUID(user_id)
     store_result = await db.execute(select(Store).where(Store.seller_id == user_uuid))
     store = store_result.scalar_one_or_none()
@@ -1536,7 +1607,8 @@ async def upload_image(
     user_id: str = Depends(get_current_user_id)
 ):
     """
-    Upload an image to Supabase Storage and return the public URL.
+    Handles secure image uploads to cloud storage (Supabase) for products, store avatars, and user profiles.
+    Abstracts the complex multi-part form data handling and bucket routing into a single, reusable utility endpoint for the frontend.
     """
     if not settings.SUPABASE_URL or not settings.SUPABASE_KEY:
         raise HTTPException(status_code=500, detail="Supabase is not configured on the backend.")
@@ -1587,13 +1659,16 @@ async def create_seller_product(
     user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Publishes a new product to the seller's store catalog.
+    Validates category constraints and automatically assigns the initial primary product image to streamline the merchant onboarding experience.
+    """
     user_uuid = uuid.UUID(user_id)
     store_result = await db.execute(select(Store).where(Store.seller_id == user_uuid))
     store = store_result.scalar_one_or_none()
     if not store:
         raise HTTPException(status_code=404, detail="Anda belum memiliki toko.")
 
-    # Validate category exists
     cat_result = await db.execute(select(Category).where(Category.id == request.category_id))
     category = cat_result.scalar_one_or_none()
     if not category:
@@ -1609,9 +1684,8 @@ async def create_seller_product(
         stock=request.stock
     )
     db.add(new_product)
-    await db.flush() # flush to get new_product.id
+    await db.flush() 
     
-    # Save image_url if provided
     if request.image_url:
         new_image = ProductImage(
             product_id=new_product.id,
@@ -1623,7 +1697,6 @@ async def create_seller_product(
     await db.commit()
     await db.refresh(new_product)
     
-    # Explicitly load relationships to return a complete response
     await db.refresh(new_product, ["category", "images"])
     return SellerProductResponse(
         id=new_product.id,
@@ -1644,13 +1717,16 @@ async def update_seller_product(
     user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Modifies an existing product's details in the seller's catalog.
+    Provides full control over pricing, stock adjustments, and image replacements while verifying the seller's ownership of the asset.
+    """
     user_uuid = uuid.UUID(user_id)
     store_result = await db.execute(select(Store).where(Store.seller_id == user_uuid))
     store = store_result.scalar_one_or_none()
     if not store:
         raise HTTPException(status_code=404, detail="Anda belum memiliki toko.")
 
-    # Get product
     prod_result = await db.execute(
         select(Product)
         .options(selectinload(Product.category), selectinload(Product.images))
@@ -1660,13 +1736,11 @@ async def update_seller_product(
     if not product:
         raise HTTPException(status_code=404, detail="Produk tidak ditemukan atau sudah dihapus.")
 
-    # Validate category
     cat_result = await db.execute(select(Category).where(Category.id == request.category_id))
     category = cat_result.scalar_one_or_none()
     if not category:
         raise HTTPException(status_code=400, detail="Kategori tidak ditemukan.")
 
-    # Update product
     product.name = request.name
     product.description = request.description
     product.price = request.price
@@ -1715,6 +1789,10 @@ async def delete_seller_product(
     user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Removes a product from the marketplace view.
+    Implements a 'soft delete' approach (flagging as deleted) instead of hard deletion to preserve historical order records and data integrity.
+    """
     user_uuid = uuid.UUID(user_id)
     store_result = await db.execute(select(Store).where(Store.seller_id == user_uuid))
     store = store_result.scalar_one_or_none()
@@ -1745,6 +1823,10 @@ async def get_buyer_wallet(
     payload: dict = Depends(RequireActiveRole(["BUYER"])),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Retrieves the current balance and transaction history of a buyer's digital wallet.
+    Features automatic wallet provisioning—if a buyer accesses their wallet for the first time, a zero-balance account is seamlessly created.
+    """
     user_id = uuid.UUID(payload.get("sub"))
     result = await db.execute(
         select(Wallet)
@@ -1754,7 +1836,6 @@ async def get_buyer_wallet(
     wallet = result.scalar_one_or_none()
 
     if not wallet:
-        # Auto-create wallet for buyer
         wallet = Wallet(buyer_id=user_id)
         db.add(wallet)
         await db.commit()
@@ -1779,6 +1860,10 @@ async def topup_buyer_wallet(
     payload: dict = Depends(RequireActiveRole(["BUYER"])),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Simulates adding funds to a buyer's digital wallet balance.
+    Records a detailed transaction ledger entry to maintain an immutable audit trail of all financial movements.
+    """
     user_id = uuid.UUID(payload.get("sub"))
     result = await db.execute(select(Wallet).where(Wallet.buyer_id == user_id))
     wallet = result.scalar_one_or_none()
@@ -1800,7 +1885,6 @@ async def topup_buyer_wallet(
     await db.refresh(wallet)
     await db.refresh(txn)
 
-    # Return updated wallet
     result2 = await db.execute(
         select(Wallet).options(selectinload(Wallet.transactions)).where(Wallet.id == wallet.id)
     )
@@ -1823,6 +1907,10 @@ async def delete_buyer_address(
     payload: dict = Depends(RequireActiveRole(["BUYER"])),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Removes a saved delivery address from the buyer's profile.
+    Protects data integrity by catching foreign key violations and blocking deletion if the address is currently linked to an active or historical order.
+    """
     user_id = uuid.UUID(payload.get("sub"))
     result = await db.execute(
         select(BuyerAddress).where(BuyerAddress.id == address_id, BuyerAddress.buyer_id == user_id)
@@ -1852,15 +1940,17 @@ async def create_promo(
     payload: dict = Depends(RequireActiveRole(["SELLER"])),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Establishes a new promotional campaign linking specific products to a discount structure.
+    Sellers can bundle multiple products under a single time-bound promo to drive sales events.
+    """
     user_id_str = payload.get("sub")
     
-    # Verify seller store
     store_res = await db.execute(select(Store).where(Store.seller_id == uuid.UUID(user_id_str)))
     store = store_res.scalar_one_or_none()
     if not store:
         raise HTTPException(status_code=400, detail="Anda belum memiliki toko.")
         
-    # Verify products belong to store
     prod_res = await db.execute(
         select(Product).where(Product.id.in_(request.product_ids), Product.store_id == store.id)
     )
@@ -1894,6 +1984,10 @@ async def get_promos(
     payload: dict = Depends(RequireActiveRole(["SELLER"])),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Retrieves the complete list of promotional campaigns configured by the seller.
+    Includes relational mapping of which products are tied to which promos to facilitate dashboard management.
+    """
     user_id_str = payload.get("sub")
     store_res = await db.execute(select(Store).where(Store.seller_id == uuid.UUID(user_id_str)))
     store = store_res.scalar_one_or_none()
@@ -1917,6 +2011,10 @@ async def update_promo(
     payload: dict = Depends(RequireActiveRole(["SELLER"])),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Updates the parameters of an existing promotional campaign, such as extending the duration or altering the discount percentage.
+    Automatically manages the complex many-to-many relationship of associated products through a complete re-sync (delete & insert) operation.
+    """
     user_id_str = payload.get("sub")
     store_res = await db.execute(select(Store).where(Store.seller_id == uuid.UUID(user_id_str)))
     store = store_res.scalar_one_or_none()
@@ -1942,7 +2040,6 @@ async def update_promo(
         promo.is_active = request.is_active
 
     if request.product_ids is not None:
-        # Verify products belong to store
         prod_res = await db.execute(
             select(Product).where(Product.id.in_(request.product_ids), Product.store_id == store.id)
         )
@@ -1950,18 +2047,15 @@ async def update_promo(
         if len(products) != len(request.product_ids):
             raise HTTPException(status_code=400, detail="Beberapa produk tidak ditemukan atau bukan milik toko Anda.")
             
-        # Delete old promo products
         from sqlalchemy import delete
         await db.execute(delete(PromoProduct).where(PromoProduct.promo_id == promo.id))
         
-        # Add new promo products
         for pid in request.product_ids:
             db.add(PromoProduct(promo_id=promo.id, product_id=pid))
 
     await db.commit()
     await db.refresh(promo)
     
-    # Reload with new promo products
     result = await db.execute(
         select(Promo).options(selectinload(Promo.promo_products)).where(Promo.id == promo_id)
     )
@@ -1977,6 +2071,10 @@ async def delete_promo(
     payload: dict = Depends(RequireActiveRole(["SELLER"])),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Terminates a promotional campaign, immediately revoking the associated discounts across all linked products.
+    Includes ownership validation to ensure a seller can only delete promotions belonging to their own store.
+    """
     user_id_str = payload.get("sub")
     store_res = await db.execute(select(Store).where(Store.seller_id == uuid.UUID(user_id_str)))
     store = store_res.scalar_one_or_none()
@@ -2004,7 +2102,10 @@ async def create_voucher(
     payload: dict = Depends(RequireActiveRole(["ADMIN"])),
     db: AsyncSession = Depends(get_db)
 ):
-    # Check if code exists
+    """
+    Generates a new global discount voucher code controlled by platform administrators.
+    Supports complex configurations like percentage vs. fixed-amount, minimum spend thresholds, max discount caps, and limited redemption quotas.
+    """
     existing = await db.execute(select(Voucher).where(Voucher.code == request.code.strip().upper()))
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="Kode voucher sudah ada.")
@@ -2029,6 +2130,10 @@ async def get_vouchers(
     payload: dict = Depends(RequireActiveRole(["ADMIN"])),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Retrieves all active platform vouchers.
+    Empowers administrators with a dashboard view to monitor voucher lifecycles, active dates, and remaining redemption quotas.
+    """
     result = await db.execute(
         select(Voucher).where(Voucher.is_deleted == False).order_by(Voucher.created_at.desc())
     )
