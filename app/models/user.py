@@ -24,9 +24,20 @@ class User(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
     email = Column(String(255), unique=True, nullable=False)
+
+    # Alias-collapsed form of `email` (see app.core.email_rules.canonicalize_email).
+    # UNIQUE lives here as well as on `email`, because UNIQUE(email) alone still lets one
+    # mailbox register unlimited accounts through plus-tags and Gmail dot variations.
+    email_canonical = Column(String(255), unique=True, nullable=False, index=True)
+
     password_hash = Column(String(255), nullable=False)
     full_name = Column(String(150), nullable=False)
     avatar_url = Column(Text, nullable=True)
+
+    # Non-null once ownership of the address has been proven. Rows only reach this table
+    # after OTP verification, so it is set at creation time and kept for auditing.
+    email_verified_at = Column(DateTime(timezone=True), nullable=True)
+
     created_at = Column(DateTime(timezone=True), server_default=text("NOW()"))
 
     # Relationships
