@@ -23,6 +23,20 @@ Gunakan akun berikut untuk menguji aplikasi sesuai dengan peran masing-masing:
 | **Buyer** | `alvindinata1998@gmail.com` | `AlvinGanteng` | Saldo dompet simulasi penuh untuk transaksi |
 | **Driver** | `alvindinata1998@gmail.com` | `AlvinGanteng` | Akses untuk *Take Job* dan *Complete Delivery* |
 
+> ℹ️ Akun-akun di atas sudah terverifikasi lewat migrasi backfill, jadi bisa langsung login tanpa melalui OTP.
+
+### ✉️ Menguji Fitur Registrasi & Verifikasi Email (OTP)
+
+Pendaftaran akun baru mewajibkan kode OTP 6 digit yang dikirim ke email, sebagai proteksi terhadap pembuatan akun massal (*bot signup*). Fitur ini **masih berjalan di tier gratis Resend (sandbox mode)**, dengan satu batasan penting: Resend sandbox hanya mengizinkan pengiriman ke satu alamat (email pemilik akun Resend), sehingga registrasi dengan email lain di **aplikasi live** belum bisa menerima OTP sungguhan (`403 domain is not verified`).
+
+**Cara menguji alur OTP secara penuh (direkomendasikan untuk reviewer/kontributor):**
+1. Jalankan backend secara lokal (lihat bagian **Setup & Instalasi Lokal** di bawah).
+2. Kosongkan/hapus `RESEND_API_KEY` di `.env` — aplikasi otomatis memakai **Console Provider**: kode OTP dicetak langsung ke terminal server, bukan dikirim sebagai email sungguhan.
+3. Daftar dengan email apa pun (mis. `test@gmail.com`) di halaman `/register`, lalu baca kode 6 digit dari terminal backend.
+4. Masukkan kode tersebut di layar verifikasi.
+
+Mode ini memungkinkan pengujian penuh (termasuk kirim ulang kode, kode salah, dan kedaluwarsa) tanpa bergantung pada kuota atau verifikasi domain Resend.
+
 ---
 
 ## 🚀 Dokumentasi Aturan Bisnis
@@ -101,6 +115,7 @@ Untuk juri atau tim penilai, berikut adalah alur simulasi lengkap:
 
 Mengingat aplikasi ini dikembangkan dalam lingkup waktu dan prioritas fitur inti *e-commerce*, terdapat beberapa fitur pendukung yang saat ini belum diimplementasikan:
 - **Cold Start (Render Free Tier):** Backend API di-*deploy* menggunakan layanan gratis dari Render.com. Jika aplikasi tidak diakses selama beberapa waktu, *server* akan masuk ke mode *idle/sleep*. Permintaan pertama setelah *idle* (*cold start*) mungkin membutuhkan waktu sekitar 30-50 detik untuk *loading*. Harap bersabar saat membuka aplikasi untuk pertama kalinya.
+- **Verifikasi Email (OTP) di Aplikasi Live (Resend Free Tier):** Pendaftaran akun baru mewajibkan kode OTP yang dikirim via Resend. Karena masih pada *sandbox mode* (domain kustom belum diverifikasi), Resend hanya bisa mengirim ke satu alamat email (milik developer) — registrasi dengan email lain di aplikasi live tidak akan menerima kode. Gunakan mode lokal dengan Console Provider untuk menguji alur ini secara penuh (lihat bagian **Menguji Fitur Registrasi & Verifikasi Email (OTP)** di atas).
 - **Visit Store / Profil Toko Publik:** Halaman khusus untuk melihat informasi dan katalog utuh dari satu toko secara terpisah belum tersedia. Katalog saat ini terpusat di halaman beranda.
 - **Lupa Password (Reset Password):** Alur pemulihan kata sandi via email belum diaktifkan (sementara hanya ada UI). Harap ingat kata sandi Anda atau gunakan akun demo yang tersedia.
 - **Payment Gateway Real-Time:** Simulasi pembayaran saat ini dipotong langsung dari saldo *Wallet* virtual bawaan sistem, belum terintegrasi dengan *payment gateway* pihak ketiga (seperti Midtrans/Stripe).
