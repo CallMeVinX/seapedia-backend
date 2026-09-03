@@ -1,54 +1,117 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Response
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.db.session import get_db
-from app.schemas.auth_schema import SelectRoleRequest, TokenResponse, LoginRequest, RegisterRequest, LoginResponse, AddRoleRequest
+from app.schemas.auth_schema import (
+    SelectRoleRequest, TokenResponse, LoginRequest, RegisterRequest, LoginResponse,
+    AddRoleRequest, VerifyRegistrationRequest, ResendOtpRequest, RegistrationChallengeResponse,
+)
 from app.api.dependencies import get_current_user_id, get_token_payload
 from app.services.auth_service import verify_user_owns_role, get_user_roles
 from app.core.security import create_access_token, verify_password, get_password_hash
 from datetime import timedelta
 from app.core.config import settings
 from app.models.user import User, UserRole, AppRole
+from app.services import registration_service
+from app.services.rate_limit_service import client_ip
+from app.core.email_rules import canonicalize_email
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
-@router.post("/register", response_model=dict)
-async def register(request: RegisterRequest, db: AsyncSession = Depends(get_db)):
+@router.post("/register", response_model=RegistrationChallengeResponse)
+async def register(
+    request: RegisterRequest,
+    http_request: Request,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db)
+):
     """
-    Handles new user registration by validating email uniqueness and assigning initial roles.
-    This ensures that each user has at least one role (defaulting to Buyer) to interact with the system.
+    Opens a registration by staging the details and emailing a one-time code.
+
+    No row is written to the users table here. Requiring proof of mailbox ownership before the
+    account exists is what stops automated sign-ups from populating the marketplace with
+    disposable accounts, claiming other people's addresses, or harvesting new-user vouchers.
+    The response is identical in every case, including when the address is already registered,
+    so the endpoint cannot be used to discover which emails hold an account.
     """
-    result = await db.execute(select(User).where(User.email == request.email))
-    if result.scalar_one_or_none():
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email already registered")
-        
-    new_user = User(
+    ip = client_ip(http_request)
+
+    recipient, full_name, code = await registration_service.start_registration(
+        db,
         email=request.email,
-        password_hash=get_password_hash(request.password),
-        full_name=request.full_name
+        password=request.password,
+        full_name=request.full_name,
+        roles=request.roles,
+        ip=ip,
     )
-    db.add(new_user)
-    await db.flush() 
-    
-    assigned_roles = []
-    if request.roles:
-        for r_str in request.roles:
-            role_enum = AppRole(r_str)
-            if not role_enum:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST, 
-                    detail=f"Invalid role: {r_str}"
-                )
-            assigned_roles.append(role_enum)
+
+    if code is not None:
+        background_tasks.add_task(registration_service.dispatch_otp_email, recipient, full_name, code)
     else:
-        assigned_roles = [AppRole.Buyer]
-        
-    for role in assigned_roles:
-        user_role = UserRole(user_id=new_user.id, role=role)
-        db.add(user_role)
-        
-    await db.commit()
-    return {"message": "User registered successfully"}
+        # The address already has an account. The owner is told so out-of-band, which keeps the
+        # HTTP response uniform while still explaining to a real user why no code arrived.
+        background_tasks.add_task(registration_service.dispatch_account_exists_email, recipient)
+
+    return RegistrationChallengeResponse(
+        message=registration_service.GENERIC_REGISTER_MESSAGE,
+        expires_in_seconds=settings.OTP_EXPIRE_MINUTES * 60,
+        resend_available_in_seconds=settings.OTP_RESEND_COOLDOWN_SECONDS,
+    )
+
+
+@router.post("/register/verify", response_model=dict)
+async def verify_registration(
+    request: VerifyRegistrationRequest,
+    http_request: Request,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Completes a registration by redeeming the one-time code, creating the account only now.
+
+    No session is issued on success. Anyone able to read the mailbox could otherwise walk away
+    with a live session, so the client is sent to the normal login flow where the password is
+    still required.
+    """
+    user = await registration_service.verify_registration(
+        db,
+        email=request.email,
+        code=request.code,
+        ip=client_ip(http_request),
+    )
+
+    return {
+        "message": "Verifikasi berhasil. Akun Anda telah aktif, silakan masuk.",
+        "user_id": str(user.id),
+        "email": user.email,
+    }
+
+
+@router.post("/register/resend", response_model=RegistrationChallengeResponse)
+async def resend_registration_otp(
+    request: ResendOtpRequest,
+    http_request: Request,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Issues a replacement code for a registration still awaiting verification.
+
+    Guarded by a per-request cooldown and a hard resend ceiling, because an uncapped resend
+    button is itself an abuse vector: it turns the mail provider into a free relay for flooding
+    an arbitrary inbox.
+    """
+    recipient, full_name, code = await registration_service.resend_otp(
+        db, email=request.email, ip=client_ip(http_request)
+    )
+
+    if code is not None:
+        background_tasks.add_task(registration_service.dispatch_otp_email, recipient, full_name, code)
+
+    return RegistrationChallengeResponse(
+        message=registration_service.GENERIC_REGISTER_MESSAGE,
+        expires_in_seconds=settings.OTP_EXPIRE_MINUTES * 60,
+        resend_available_in_seconds=settings.OTP_RESEND_COOLDOWN_SECONDS,
+    )
 
 
 @router.post("/login", response_model=LoginResponse)
@@ -57,7 +120,8 @@ async def login(request: LoginRequest, response: Response, db: AsyncSession = De
     Authenticates user credentials and issues a base JWT.
     The initial token intentionally omits the 'active_role' claim to force the client to explicitly select a role before accessing protected resources.
     """
-    result = await db.execute(select(User).where(User.email == request.email))
+    canonical = canonicalize_email(request.email)
+    result = await db.execute(select(User).where(User.email_canonical == canonical))
     user = result.scalar_one_or_none()
     
     if not user or not verify_password(request.password, user.password_hash):
