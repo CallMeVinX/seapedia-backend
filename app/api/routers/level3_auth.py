@@ -13,10 +13,14 @@ from datetime import timedelta
 from app.core.config import settings
 from app.models.user import User, UserRole, AppRole
 from app.services import registration_service
-from app.services.rate_limit_service import client_ip
+from app.services.rate_limit_service import client_ip, hit as rate_limit_hit
 from app.core.email_rules import canonicalize_email
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
+
+# Roles a user may grant themselves. Admin is intentionally excluded so it can only be
+# assigned out-of-band by a trusted process, never through a self-service request.
+SELF_ASSIGNABLE_ROLES = frozenset({AppRole.Buyer, AppRole.Seller, AppRole.Driver})
 
 @router.post("/register", response_model=RegistrationChallengeResponse)
 async def register(
@@ -115,15 +119,40 @@ async def resend_registration_otp(
 
 
 @router.post("/login", response_model=LoginResponse)
-async def login(request: LoginRequest, response: Response, db: AsyncSession = Depends(get_db)):
-    """
-    Authenticates user credentials and issues a base JWT.
-    The initial token intentionally omits the 'active_role' claim to force the client to explicitly select a role before accessing protected resources.
+async def login(
+    request: LoginRequest,
+    response: Response,
+    http_request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Authenticate credentials and issue a base JWT (no active_role claim yet).
+
+    The attempt is rate limited per source IP and per targeted account before any password
+    check runs, so the endpoint cannot be used for unbounded credential stuffing or password
+    brute forcing. Limits are enforced on both dimensions so neither one machine against many
+    accounts nor many machines against one account slips through.
     """
     canonical = canonicalize_email(request.email)
+    ip = client_ip(http_request)
+
+    ip_limit = await rate_limit_hit(
+        db, f"login_ip:{ip}", settings.LOGIN_MAX_PER_IP_PER_15MIN, 900
+    )
+    account_limit = await rate_limit_hit(
+        db, f"login_acct:{canonical}", settings.LOGIN_MAX_PER_ACCOUNT_PER_15MIN, 900
+    )
+    await db.commit()  # persist the counters so a rejected attempt still consumes its slot
+    if not ip_limit.allowed or not account_limit.allowed:
+        retry_after = max(ip_limit.retry_after_seconds, account_limit.retry_after_seconds)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Terlalu banyak percobaan masuk. Silakan coba lagi nanti.",
+            headers={"Retry-After": str(retry_after)},
+        )
+
     result = await db.execute(select(User).where(User.email_canonical == canonical))
     user = result.scalar_one_or_none()
-    
+
     if not user or not verify_password(request.password, user.password_hash):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -222,19 +251,28 @@ async def add_role(
     payload: dict = Depends(get_token_payload),
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    Grants an additional role to the authenticated user.
-    This allows a seamless transition between personas (e.g., Buyer becoming a Seller) without requiring multiple accounts.
+    """Grant an additional self-service role to the authenticated user.
+
+    Only Buyer, Seller, and Driver may be self-assigned. Admin is never grantable through
+    this endpoint: without that restriction any authenticated user could escalate to full
+    administrative access, since the endpoint otherwise trusts the requested role verbatim.
     """
     user_id = payload.get("sub")
     if not user_id:
         raise HTTPException(status_code=401, detail="Invalid token payload")
-        
-    role_enum = AppRole(request.role.upper())
-    if not role_enum:
+
+    try:
+        role_enum = AppRole(request.role.upper())
+    except ValueError:
         raise HTTPException(status_code=400, detail=f"Invalid role: {request.role}")
 
-    owns_role = await verify_user_owns_role(db, user_id=user_id, role=request.role)
+    if role_enum not in SELF_ASSIGNABLE_ROLES:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Role '{role_enum.value}' cannot be self-assigned.",
+        )
+
+    owns_role = await verify_user_owns_role(db, user_id=user_id, role=role_enum.value)
     if owns_role:
         return {"message": f"User already has the role: {request.role}"}
 

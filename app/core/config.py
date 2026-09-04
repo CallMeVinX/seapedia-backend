@@ -1,4 +1,10 @@
 from pydantic_settings import BaseSettings
+from pydantic import model_validator
+
+# Placeholder secret shipped for local development. It must never reach production, where a
+# known signing key means anyone can forge a valid JWT for any user and role.
+_INSECURE_DEFAULT_SECRET = "supersecretkey"
+
 
 class Settings(BaseSettings):
     PROJECT_NAME: str = "Seapedia Backend"
@@ -42,9 +48,24 @@ class Settings(BaseSettings):
     SIGNUP_MAX_PER_IP_PER_DAY: int = 20
     VERIFY_MAX_PER_IP_PER_HOUR: int = 30
 
+    # Login brute-force throttle. Counted per IP and per targeted account so neither a single
+    # source hammering many accounts nor many sources hammering one account goes unbounded.
+    LOGIN_MAX_PER_IP_PER_15MIN: int = 20
+    LOGIN_MAX_PER_ACCOUNT_PER_15MIN: int = 10
+
     # Reject addresses whose domain publishes no MX record (catches typos and
     # throwaway domains). Fails open when DNS itself is unreachable.
     SIGNUP_REQUIRE_MX_RECORD: bool = True
+
+    @model_validator(mode="after")
+    def _forbid_insecure_secret_in_production(self):
+        """Refuse to boot in production with the development signing key still in place."""
+        if self.ENVIRONMENT == "production" and self.SECRET_KEY == _INSECURE_DEFAULT_SECRET:
+            raise ValueError(
+                "SECRET_KEY is set to the insecure development default in a production "
+                "environment. Set a strong, unique SECRET_KEY before deploying."
+            )
+        return self
 
     class Config:
         env_file = ".env"
