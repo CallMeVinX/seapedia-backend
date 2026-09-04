@@ -845,10 +845,36 @@ async def get_order_tracking(
     payload: dict = Depends(get_token_payload),
     db: AsyncSession = Depends(get_db)
 ):
+    """Return the chronological status history of an order.
+
+    Access is restricted to the parties of the order: its buyer, the seller who owns the
+    fulfilling store, the assigned driver, or an Admin. Without this ownership check the
+    endpoint leaks other users' order history and buyer identifiers to any authenticated
+    caller iterating over sequential order ids.
     """
-    Retrieves the complete chronological status history of a specific order.
-    Essential for transparency, allowing buyers, sellers, and drivers to track the lifecycle of an order from payment to final delivery.
-    """
+    user_id_str = payload.get("sub")
+    if not user_id_str:
+        raise HTTPException(status_code=401, detail="Invalid token payload")
+    user_id = uuid.UUID(user_id_str)
+    active_role = (payload.get("active_role") or "").upper()
+
+    order = await db.scalar(select(Order).where(Order.id == order_id))
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    authorized = active_role == "ADMIN" or order.buyer_id == user_id
+    if not authorized and active_role == "SELLER":
+        store = await db.scalar(select(Store).where(Store.seller_id == user_id))
+        authorized = store is not None and order.store_id == store.id
+    if not authorized and active_role == "DRIVER":
+        job = await db.scalar(select(DeliveryJob).where(DeliveryJob.order_id == order_id))
+        authorized = job is not None and job.driver_id == user_id
+
+    if not authorized:
+        # 404 rather than 403 so the endpoint does not confirm the order exists to a caller
+        # who has no relationship to it.
+        raise HTTPException(status_code=404, detail="Order not found")
+
     result = await db.execute(
         select(OrderStatusHistory)
         .where(OrderStatusHistory.order_id == order_id)
@@ -1606,44 +1632,56 @@ async def upload_image(
     type: str = Query("product", description="Type of image: 'product', 'store', or 'user'"),
     user_id: str = Depends(get_current_user_id)
 ):
+    """Upload an image to Supabase storage for a product, store, or user avatar.
+
+    The uploaded bytes are validated by decoding them as an image rather than trusting the
+    client-supplied content type or filename extension, both of which are forgeable. This
+    prevents a caller from storing active content (e.g. HTML/SVG with script) in a public
+    bucket and serving stored XSS from the storage origin. The stored filename and content
+    type are derived from the verified image format, not from the request.
     """
-    Handles secure image uploads to cloud storage (Supabase) for products, store avatars, and user profiles.
-    Abstracts the complex multi-part form data handling and bucket routing into a single, reusable utility endpoint for the frontend.
-    """
+    MAX_BYTES = 5 * 1024 * 1024
+    ALLOWED_FORMATS = {"JPEG": "jpg", "PNG": "png", "WEBP": "webp", "GIF": "gif"}
+
     if not settings.SUPABASE_URL or not settings.SUPABASE_KEY:
         raise HTTPException(status_code=500, detail="Supabase is not configured on the backend.")
-        
-    if not file.content_type.startswith('image/'):
-        raise HTTPException(status_code=400, detail="File must be an image")
-        
-    if file.size and file.size > 5 * 1024 * 1024:
+
+    # Read first, then size-check the actual bytes: file.size is client-reported and may be
+    # absent for chunked uploads, so it cannot be relied on as the limit.
+    content = await file.read()
+    if len(content) > MAX_BYTES:
         raise HTTPException(status_code=400, detail="File too large. Max 5MB")
 
-    # Determine bucket based on type
-    if type == "store":
-        bucket_name = "store-avatars"
-    elif type == "user":
-        bucket_name = "avatars"
-    else:
-        bucket_name = "product-images"
+    from PIL import Image, UnidentifiedImageError
+    import io
 
-    # Read file content
-    content = await file.read()
-    
-    # Generate unique filename
+    try:
+        with Image.open(io.BytesIO(content)) as img:
+            img.verify()  # decodes headers/structure; raises on anything that is not a real image
+            detected_format = img.format
+    except (UnidentifiedImageError, Exception):
+        raise HTTPException(status_code=400, detail="File must be a valid image (JPEG, PNG, WEBP, or GIF).")
+
+    if detected_format not in ALLOWED_FORMATS:
+        raise HTTPException(status_code=400, detail="Unsupported image format.")
+
+    ext = ALLOWED_FORMATS[detected_format]
+    safe_content_type = f"image/{'jpeg' if ext == 'jpg' else ext}"
+
+    bucket_map = {"store": "store-avatars", "user": "avatars"}
+    bucket_name = bucket_map.get(type, "product-images")
+
     import uuid
     import time
-    ext = file.filename.split('.')[-1] if '.' in file.filename else 'jpg'
     file_name = f"{uuid.uuid4()}_{int(time.time())}.{ext}"
-    
+
     try:
         supabase: Client = create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
-        
-        # Upload
+
         res = supabase.storage.from_(bucket_name).upload(
             path=file_name,
             file=content,
-            file_options={"content-type": file.content_type}
+            file_options={"content-type": safe_content_type}
         )
         
         # Get public url
@@ -1860,12 +1898,16 @@ async def topup_buyer_wallet(
     payload: dict = Depends(RequireActiveRole(["BUYER"])),
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    Simulates adding funds to a buyer's digital wallet balance.
-    Records a detailed transaction ledger entry to maintain an immutable audit trail of all financial movements.
+    """Add funds to the buyer's wallet and record a ledger entry.
+
+    The wallet row is locked FOR UPDATE before the balance is read so concurrent top-ups
+    serialize instead of racing on a read-modify-write, which would otherwise let one request
+    overwrite another's increment and silently drop funds.
     """
     user_id = uuid.UUID(payload.get("sub"))
-    result = await db.execute(select(Wallet).where(Wallet.buyer_id == user_id))
+    result = await db.execute(
+        select(Wallet).where(Wallet.buyer_id == user_id).with_for_update()
+    )
     wallet = result.scalar_one_or_none()
 
     if not wallet:
