@@ -14,3 +14,4 @@ alembic
 bcrypt
 httpx
 dnspython
+Pillow
