@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 from typing import List, Optional
 
 class TokenResponse(BaseModel):
@@ -116,13 +116,34 @@ class ForgotPasswordResponse(BaseModel):
     resend_available_in_seconds: int
 
 
+class VerifyResetCodeRequest(BaseModel):
+    """
+    Payload untuk memverifikasi kode PIN 6 digit sebelum pengguna membuka form ganti kata sandi baru.
+    """
+    email: EmailStr = Field(..., description="Alamat email akun yang meminta pemulihan kata sandi.")
+    code: str = Field(..., min_length=6, max_length=6, pattern=r"^\d{6}$", description="Kode PIN verifikasi 6 digit angka.")
+
+
+class VerifyResetCodeResponse(BaseModel):
+    """
+    Respons setelah kode PIN 6 digit berhasil divalidasi.
+    Menyediakan reset_token yang wajib dikirimkan saat mengisi form kata sandi baru.
+    """
+    message: str = Field(..., description="Pesan konfirmasi keberhasilan verifikasi kode PIN.")
+    reset_token: str = Field(..., description="Token otorisasi pemulihan sementara bertanda tangan kriptografis.")
+    expires_in_seconds: int = Field(..., description="Masa berlaku reset_token dalam detik.")
+
+
 class ResetPasswordRequest(BaseModel):
     """
-    Payload to verify recovery OTP and assign a replacement password.
+    Payload untuk mengatur kata sandi baru.
+    Mendukung skema best-practice menggunakan `reset_token` (setelah PIN lolos verifikasi),
+    maupun skema backward-compatibility dengan menyertakan `email` dan `code`.
     """
-    email: EmailStr
-    code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
-    new_password: str = Field(min_length=8, max_length=128)
+    reset_token: Optional[str] = Field(default=None, description="Token otorisasi yang didapat dari /reset-password/verify.")
+    email: Optional[EmailStr] = Field(default=None, description="Alamat email akun (opsional jika menggunakan reset_token).")
+    code: Optional[str] = Field(default=None, min_length=6, max_length=6, pattern=r"^\d{6}$", description="Kode OTP 6 digit (opsional jika menggunakan reset_token).")
+    new_password: str = Field(min_length=8, max_length=128, description="Kata sandi baru pengguna.")
 
     @field_validator("new_password")
     @classmethod
@@ -131,9 +152,16 @@ class ResetPasswordRequest(BaseModel):
             raise ValueError("Kata sandi baru harus mengandung huruf dan angka.")
         return value
 
+    @model_validator(mode="after")
+    def check_token_or_code_present(self) -> "ResetPasswordRequest":
+        if not self.reset_token and not (self.email and self.code):
+            raise ValueError("Wajib menyertakan 'reset_token' dari tahap verifikasi PIN, atau kombinasi 'email' dan 'code'.")
+        return self
+
 
 class ResetPasswordResponse(BaseModel):
     """
-    Confirms successful password reassignment.
+    Konfirmasi keberhasilan pembaruan kata sandi akun.
     """
-    message: str
+    message: str = Field(..., description="Pesan konfirmasi berhasil memperbarui kata sandi.")
+

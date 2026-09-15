@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Union
 from jose import jwt
 import bcrypt
@@ -40,9 +40,9 @@ def create_access_token(
         to_encode["active_role"] = active_role.upper()
 
     if expires_delta:
-        expire = datetime.utcnow() + expires_delta
+        expire = datetime.now(timezone.utc) + expires_delta
     else:
-        expire = datetime.utcnow() + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+        expire = datetime.now(timezone.utc) + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
     
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
@@ -85,3 +85,48 @@ def verify_otp(code: str, stored_hash: str) -> bool:
     which reduces a brute-force search from 10^6 to roughly 10*6 attempts.
     """
     return hmac.compare_digest(hash_otp(code), stored_hash)
+
+
+def create_password_reset_token(
+    email: str,
+    challenge_id: str,
+    expires_delta: Optional[timedelta] = None,
+) -> str:
+    """
+    Menghasilkan JWT bertanda tangan kriptografis khusus untuk otorisasi form ganti kata sandi.
+
+    Klaim yang disertakan:
+    - `sub`: Alamat email pengguna.
+    - `challenge_id`: ID unik sesi tantangan pemulihan kata sandi.
+    - `purpose`: Bernilai konstan 'password_reset' untuk mencegah token disalahgunakan sebagai access token.
+    - `exp`: Batas kedaluwarsa token (default: 15 menit).
+    """
+    if expires_delta:
+        expire = datetime.now(timezone.utc) + expires_delta
+    else:
+        expire = datetime.now(timezone.utc) + timedelta(minutes=15)
+
+    to_encode = {
+        "sub": email,
+        "challenge_id": str(challenge_id),
+        "purpose": "password_reset",
+        "exp": expire,
+    }
+    return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+
+
+def verify_password_reset_token(token: str) -> Optional[dict]:
+    """
+    Mendekode dan memvalidasi keabsahan token reset kata sandi.
+
+    Memastikan tanda tangan kriptografis valid, belum kedaluwarsa, dan tujuan token adalah 'password_reset'.
+    Mengembalikan dictionary payload jika valid, atau None jika tidak valid/kedaluwarsa.
+    """
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        if payload.get("purpose") != "password_reset":
+            return None
+        return payload
+    except Exception:
+        return None
+

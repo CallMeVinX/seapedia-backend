@@ -4,6 +4,7 @@ from sqlalchemy import select
 from app.db.session import get_db
 from app.schemas.auth_schema import (
     ForgotPasswordRequest, ForgotPasswordResponse, ResetPasswordRequest, ResetPasswordResponse,
+    VerifyResetCodeRequest, VerifyResetCodeResponse,
     SelectRoleRequest, TokenResponse, LoginRequest, RegisterRequest, LoginResponse,
     AddRoleRequest, VerifyRegistrationRequest, ResendOtpRequest, RegistrationChallengeResponse,
 )
@@ -307,27 +308,82 @@ async def forgot_password(
     )
 
 
-@router.post("/reset-password", response_model=ResetPasswordResponse)
+@router.post(
+    "/reset-password/verify",
+    response_model=VerifyResetCodeResponse,
+    summary="Verifikasi Kode PIN Reset Password",
+    description="Tahap 2: Pengguna wajib memasukkan kode PIN 6 digit yang dikirim ke email. "
+                "Jika kode valid, server mengembalikan `reset_token` kriptografis yang digunakan "
+                "oleh antarmuka pengguna untuk membuka dan menampilkan form ganti kata sandi baru.",
+)
+@router.post(
+    "/verify-reset-code",
+    response_model=VerifyResetCodeResponse,
+    include_in_schema=False,
+)
+async def verify_reset_password_code(
+    request: VerifyResetCodeRequest,
+    http_request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Memverifikasi keabsahan kode PIN 6 digit pemulihan kata sandi.
+
+    - **email**: Alamat email akun terdaftar.
+    - **code**: Kode PIN 6 digit yang diterima pengguna.
+
+    Mengembalikan `reset_token` berumur pendek (15 menit) yang digunakan sebagai
+    bukti otorisasi untuk menampilkan form ganti kata sandi dan mengeksekusi reset kata sandi.
+    """
+    ip = client_ip(http_request)
+    _, reset_token, expires_in_seconds = await password_reset_service.verify_reset_code(
+        db,
+        email=request.email,
+        code=request.code,
+        ip=ip,
+    )
+
+    return VerifyResetCodeResponse(
+        message="Kode verifikasi berhasil divalidasi. Silakan lanjutkan pengisian kata sandi baru.",
+        reset_token=reset_token,
+        expires_in_seconds=expires_in_seconds,
+    )
+
+
+@router.post(
+    "/reset-password",
+    response_model=ResetPasswordResponse,
+    summary="Setel Kata Sandi Baru",
+    description="Tahap 3: Form ganti password baru mengirimkan `reset_token` yang didapatkan dari tahap 2 "
+                "bersama dengan kata sandi baru. Setelah berhasil diubah, sesi dan token langsung dianulir (single-use).",
+)
 async def reset_password(
     request: ResetPasswordRequest,
     http_request: Request,
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Validates recovery OTP and updates the account password.
+    Memvalidasi otorisasi pemulihan kata sandi dan memperbarui kata sandi pengguna.
+
+    - **reset_token**: Token otorisasi yang diperoleh dari `/reset-password/verify` (Direkomendasikan).
+    - **email**: Alamat email akun (opsional jika menggunakan `reset_token`).
+    - **code**: Kode PIN 6 digit (opsional jika menggunakan `reset_token`).
+    - **new_password**: Kata sandi baru (minimal 8 karakter, wajib mengandung huruf dan angka).
     """
     ip = client_ip(http_request)
     await password_reset_service.verify_and_reset_password(
         db,
+        new_password=request.new_password,
+        reset_token=request.reset_token,
         email=request.email,
         code=request.code,
-        new_password=request.new_password,
         ip=ip,
     )
 
     return ResetPasswordResponse(
         message="Kata sandi berhasil diperbarui. Silakan masuk menggunakan kata sandi baru Anda."
     )
+
 
 
 @router.post("/reset-password/resend", response_model=ForgotPasswordResponse)

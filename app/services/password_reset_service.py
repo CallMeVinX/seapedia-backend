@@ -5,8 +5,10 @@ Provides challenge issuance with 6-digit numeric OTPs, throttled resends,
 rate-limited verification, and secure password updating.
 """
 
+import hashlib
+import hmac
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, Tuple
 
 from fastapi import HTTPException, status
 from sqlalchemy import delete, func, select, update
@@ -15,7 +17,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.email_rules import canonicalize_email
-from app.core.security import generate_otp, get_password_hash, hash_otp, verify_otp
+from app.core.security import (
+    create_password_reset_token,
+    generate_otp,
+    get_password_hash,
+    hash_otp,
+    verify_otp,
+    verify_password_reset_token,
+)
 from app.models.user import User
 from app.models.verification import PasswordResetChallenge
 from app.services import rate_limit_service
@@ -153,17 +162,200 @@ async def resend_password_reset_otp(
     return user.email, user.full_name, code
 
 
-async def verify_and_reset_password(
+async def verify_reset_code(
     db: AsyncSession,
     *,
     email: str,
     code: str,
+    ip: str = "unknown",
+) -> tuple[User, str, int]:
+    """
+    Memverifikasi kode PIN 6 digit pemulihan kata sandi pengguna (Tahap 2 alur forgot-password).
+
+    Prinsip Best Practice & Keamanan:
+    1. Memvalidasi bahwa akun dan sesi tantangan (PasswordResetChallenge) aktif di database.
+    2. Memastikan sesi belum kedaluwarsa dan batas salah mencoba (OTP_MAX_ATTEMPTS) belum terlampaui.
+    3. Memverifikasi kecocokan kode PIN dengan HMAC hash di database secara konstan waktu (constant-time).
+    4. Menerbitkan JWT reset_token berumur pendek (15 menit) bertanda tangan kriptografis (HS256)
+       yang hanya sah untuk tujuan 'password_reset'.
+    5. Menginvaliasi PIN 6 digit tersebut dengan menyimpan fingerprint (SHA-256) dari reset_token pada DB,
+       sehingga PIN lama tidak dapat dipergunakan ulang (single-use OTP).
+
+    Mengembalikan: (User, reset_token, expires_in_seconds)
+    Raises: HTTPException(400/429/404) jika verifikasi gagal.
+    """
+    canonical = canonicalize_email(email)
+
+    user = await db.scalar(select(User).where(User.email_canonical == canonical))
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email tidak terdaftar atau sesi pemulihan tidak valid.",
+        )
+
+    challenge = await db.scalar(
+        select(PasswordResetChallenge).where(PasswordResetChallenge.email_canonical == canonical)
+    )
+    if challenge is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Tidak ada sesi pemulihan kata sandi aktif untuk email ini. Silakan ajukan permintaan baru.",
+        )
+
+    if challenge.expires_at <= _now():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Kode verifikasi sudah kedaluwarsa. Silakan minta kode baru.",
+        )
+
+    if challenge.attempts >= settings.OTP_MAX_ATTEMPTS:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Terlalu banyak percobaan kode yang salah. Batas maksimal tercapai. Silakan minta kode baru.",
+        )
+
+    # Catat penambahan attempt percobaan
+    await db.execute(
+        update(PasswordResetChallenge)
+        .where(PasswordResetChallenge.id == challenge.id)
+        .values(attempts=PasswordResetChallenge.attempts + 1)
+    )
+
+    if not verify_otp(code, challenge.code_hash):
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Kode verifikasi PIN salah. Harap periksa kembali 6 digit kode yang dikirim ke email Anda.",
+        )
+
+    # Terbitkan token otorisasi reset_token bertanda tangan kriptografis
+    reset_token = create_password_reset_token(
+        email=user.email,
+        challenge_id=str(challenge.id),
+        expires_delta=timedelta(minutes=15),
+    )
+
+    # Simpan sidik jari token (SHA-256) pada baris tantangan untuk mengunci sesi ke token ini
+    token_fingerprint = hashlib.sha256(reset_token.encode("utf-8")).hexdigest()
+    await db.execute(
+        update(PasswordResetChallenge)
+        .where(PasswordResetChallenge.id == challenge.id)
+        .values(
+            code_hash=token_fingerprint,
+            attempts=0,
+            expires_at=_now() + timedelta(minutes=15),
+        )
+    )
+    await db.commit()
+
+    expires_in_seconds = 15 * 60
+    return user, reset_token, expires_in_seconds
+
+
+async def reset_password_with_token(
+    db: AsyncSession,
+    *,
+    reset_token: str,
     new_password: str,
-    ip: str,
+    ip: str = "unknown",
 ) -> User:
     """
-    Verifies the provided recovery OTP and updates the account password hash.
+    Memperbarui kata sandi akun menggunakan token otorisasi reset_token yang sah (Tahap 3 alur forgot-password).
+
+    Prinsip Best Practice & Keamanan:
+    1. Memverifikasi integritas cryptographic signature dan expiry token JWT via SECRET_KEY.
+    2. Mencocokkan challenge_id dan fingerprint token dengan catatan di database.
+    3. Memperbarui password_hash dengan algoritma bcrypt.
+    4. Menghapus sesi PasswordResetChallenge dari database sehingga token hanya dapat dipakai satu kali (single-use).
+
+    Mengembalikan: Objek User yang telah diperbarui.
+    Raises: HTTPException(400/404) jika token tidak sah atau sesi tidak ditemukan.
     """
+    payload = verify_password_reset_token(reset_token)
+    if not payload:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Token otorisasi ganti kata sandi tidak valid atau sudah kedaluwarsa. Silakan ulangi verifikasi PIN.",
+        )
+
+    email = payload.get("sub")
+    challenge_id = payload.get("challenge_id")
+    if not email or not challenge_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Klaim token pemulihan tidak valid.",
+        )
+
+    canonical = canonicalize_email(email)
+    challenge = await db.scalar(
+        select(PasswordResetChallenge).where(
+            PasswordResetChallenge.id == challenge_id,
+            PasswordResetChallenge.email_canonical == canonical,
+        )
+    )
+    if challenge is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Sesi reset kata sandi telah kedaluwarsa atau sudah pernah digunakan. Silakan ajukan permintaan baru.",
+        )
+
+    if challenge.expires_at <= _now():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Sesi reset kata sandi telah kedaluwarsa. Silakan lakukan verifikasi ulang.",
+        )
+
+    # Validasi kesesuaian fingerprint token dengan sesi di database
+    token_fingerprint = hashlib.sha256(reset_token.encode("utf-8")).hexdigest()
+    if not hmac.compare_digest(challenge.code_hash, token_fingerprint):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Token reset tidak cocok dengan sesi verifikasi PIN aktif.",
+        )
+
+    user = await db.scalar(select(User).where(User.email_canonical == canonical))
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pengguna tidak ditemukan.",
+        )
+
+    user.password_hash = get_password_hash(new_password)
+
+    # Hapus tantangan dari database (Single-use guarantee: mencegah replay attack)
+    await db.execute(
+        delete(PasswordResetChallenge).where(PasswordResetChallenge.id == challenge.id)
+    )
+    await db.commit()
+    return user
+
+
+async def verify_and_reset_password(
+    db: AsyncSession,
+    *,
+    new_password: str,
+    reset_token: Optional[str] = None,
+    email: Optional[str] = None,
+    code: Optional[str] = None,
+    ip: str = "unknown",
+) -> User:
+    """
+    Fungsi penghubung terpadu untuk pembaruan kata sandi.
+
+    Mendukung skema best-practice berbasis `reset_token`,
+    serta skema backward-compatibility berbasis `email` dan `code`.
+    """
+    if reset_token:
+        return await reset_password_with_token(
+            db, reset_token=reset_token, new_password=new_password, ip=ip
+        )
+
+    if not email or not code:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Harap sertakan reset_token hasil verifikasi PIN atau kombinasi email dan kode verifikasi.",
+        )
+
     canonical = canonicalize_email(email)
 
     challenge = await db.scalar(
