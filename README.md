@@ -25,17 +25,17 @@ Gunakan akun berikut untuk menguji aplikasi sesuai dengan peran masing-masing:
 
 > ℹ️ Akun-akun di atas sudah terverifikasi lewat migrasi backfill, jadi bisa langsung login tanpa melalui OTP.
 
-### ✉️ Menguji Fitur Registrasi & Verifikasi Email (OTP)
+### ✉️ Menguji Fitur Registrasi & Lupa Password (OTP Email)
 
-Pendaftaran akun baru mewajibkan kode OTP 6 digit yang dikirim ke email, sebagai proteksi terhadap pembuatan akun massal (*bot signup*). Fitur ini **masih berjalan di tier gratis Resend (sandbox mode)**, dengan satu batasan penting: Resend sandbox hanya mengizinkan pengiriman ke satu alamat (email pemilik akun Resend), sehingga registrasi dengan email lain di **aplikasi live** belum bisa menerima OTP sungguhan (`403 domain is not verified`).
+Pendaftaran akun baru dan pemulihan kata sandi (*Forgot Password*) mewajibkan kode OTP 6 digit yang dikirim ke email, sebagai proteksi terhadap pembuatan akun massal (*bot signup*) dan pengambilalihan akun. Fitur ini **masih berjalan di tier gratis Resend (sandbox mode)**, dengan satu batasan penting: Resend sandbox hanya mengizinkan pengiriman ke satu alamat (email pemilik akun Resend), sehingga pengiriman ke email lain di **aplikasi live** belum bisa menerima OTP sungguhan (`403 domain is not verified`).
 
 **Cara menguji alur OTP secara penuh (direkomendasikan untuk reviewer/kontributor):**
 1. Jalankan backend secara lokal (lihat bagian **Setup & Instalasi Lokal** di bawah).
-2. Kosongkan/hapus `RESEND_API_KEY` di `.env` — aplikasi otomatis memakai **Console Provider**: kode OTP dicetak langsung ke terminal server, bukan dikirim sebagai email sungguhan.
-3. Daftar dengan email apa pun (mis. `test@gmail.com`) di halaman `/register`, lalu baca kode 6 digit dari terminal backend.
-4. Masukkan kode tersebut di layar verifikasi.
+2. Kosongkan/hapus `RESEND_API_KEY` di `.env` — aplikasi otomatis memakai **Console Provider**: kode OTP dicetak langsung ke terminal server backend, bukan dikirim sebagai email sungguhan.
+3. Untuk **Registrasi**: Daftar dengan email apa pun (mis. `test@gmail.com`) di halaman `/register`, lalu baca kode 6 digit dari terminal backend dan masukkan di layar verifikasi OTP.
+4. Untuk **Lupa Password**: Buka halaman `/forgot-password` (atau klik *Lupa kata sandi?* di `/login`), masukkan email akun terdaftar, baca kode 6 digit dari terminal backend, verifikasi kode, lalu atur kata sandi baru.
 
-Mode ini memungkinkan pengujian penuh (termasuk kirim ulang kode, kode salah, dan kedaluwarsa) tanpa bergantung pada kuota atau verifikasi domain Resend.
+Mode ini memungkinkan pengujian penuh alur OTP (termasuk kirim ulang kode, batas *rate limiting*, kode salah, dan kedaluwarsa) tanpa bergantung pada kuota atau verifikasi domain Resend.
 
 ---
 
@@ -79,6 +79,7 @@ Aplikasi ini diarsiteki dengan lapis keamanan tinggi yang diwajibkan dalam produ
 5. **RBAC (Role-Based Access Control):** 
    - **Frontend:** Menggunakan *Guard Agents (Route Layouts)* yang merender halaman hanya jika sesi peran *user* valid, jika tidak dialihkan kembali (Redirect).
    - **Backend:** Menggunakan mekanisme *Dependency Injection* yang menolak API *request* (HTTP 403 Forbidden) jika pengguna tidak menggunakan peran yang sah pada sesinya.
+6. **Rate Limiting & Brute-Force Prevention:** Backend menerapkan *atomic rate limiter* pada percobaan login, pendaftaran akun, permintaan kode OTP, serta validasi 6-digit PIN untuk mencegah serangan *brute-force* dan *abuse*.
 
 ---
 
@@ -108,6 +109,11 @@ Untuk juri atau tim penilai, berikut adalah alur simulasi lengkap:
    - Buat pesanan baru dengan metode Next Day (SLA 24 Jam). Konfirmasi pesanan lewat Seller, biarkan status "Menunggu Pengirim".
    - Login sebagai Admin. Tekan tombol **Simulasi (+1 Hari)** di Dashboard.
    - Periksa kembali status pesanan, sistem otomatis membatalkannya (Overdue), mengembalikan stok produk, dan me-refund saldo Buyer.
+5. **Simulasi Lupa Password (Reset Password):**
+   - Buka halaman Login -> klik tautan **"Lupa kata sandi?"** (atau akses `/forgot-password`).
+   - Masukkan email akun Anda (mis. `alvindinata1998@gmail.com`).
+   - Masukkan kode OTP 6 digit dari terminal server backend (atau email), lalu tentukan kata sandi baru.
+   - Masuk kembali menggunakan kata sandi baru tersebut.
 
 ---
 
@@ -115,9 +121,8 @@ Untuk juri atau tim penilai, berikut adalah alur simulasi lengkap:
 
 Mengingat aplikasi ini dikembangkan dalam lingkup waktu dan prioritas fitur inti *e-commerce*, terdapat beberapa fitur pendukung yang saat ini belum diimplementasikan:
 - **Cold Start (Render Free Tier):** Backend API di-*deploy* menggunakan layanan gratis dari Render.com. Jika aplikasi tidak diakses selama beberapa waktu, *server* akan masuk ke mode *idle/sleep*. Permintaan pertama setelah *idle* (*cold start*) mungkin membutuhkan waktu sekitar 30-50 detik untuk *loading*. Harap bersabar saat membuka aplikasi untuk pertama kalinya.
-- **Verifikasi Email (OTP) di Aplikasi Live (Resend Free Tier):** Pendaftaran akun baru mewajibkan kode OTP yang dikirim via Resend. Karena masih pada *sandbox mode* (domain kustom belum diverifikasi), Resend hanya bisa mengirim ke satu alamat email (milik developer) — registrasi dengan email lain di aplikasi live tidak akan menerima kode. Gunakan mode lokal dengan Console Provider untuk menguji alur ini secara penuh (lihat bagian **Menguji Fitur Registrasi & Verifikasi Email (OTP)** di atas).
+- **Verifikasi Email (OTP) di Aplikasi Live (Resend Free Tier):** Pendaftaran akun baru dan reset password mewajibkan kode OTP yang dikirim via Resend. Karena masih pada *sandbox mode* (domain kustom belum diverifikasi), Resend hanya bisa mengirim ke satu alamat email (milik developer) — registrasi/reset password dengan email lain di aplikasi live belum bisa menerima kode. Gunakan mode lokal dengan Console Provider untuk menguji alur ini secara penuh (lihat bagian **Menguji Fitur Registrasi & Lupa Password (OTP Email)** di atas).
 - **Visit Store / Profil Toko Publik:** Halaman khusus untuk melihat informasi dan katalog utuh dari satu toko secara terpisah belum tersedia. Katalog saat ini terpusat di halaman beranda.
-- **Lupa Password (Reset Password):** Alur pemulihan kata sandi via email belum diaktifkan (sementara hanya ada UI). Harap ingat kata sandi Anda atau gunakan akun demo yang tersedia.
 - **Payment Gateway Real-Time:** Simulasi pembayaran saat ini dipotong langsung dari saldo *Wallet* virtual bawaan sistem, belum terintegrasi dengan *payment gateway* pihak ketiga (seperti Midtrans/Stripe).
 
 ---
