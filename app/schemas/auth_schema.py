@@ -98,3 +98,42 @@ class UserProfileResponse(BaseModel):
 class UserProfileUpdateRequest(BaseModel):
     full_name: Optional[str] = None
     avatar_url: Optional[str] = None
+
+
+class ForgotPasswordRequest(BaseModel):
+    """
+    Payload to initiate password recovery for an account.
+    """
+    email: EmailStr
+
+
+class ForgotPasswordResponse(BaseModel):
+    """
+    Response providing client-side challenge timing metrics.
+    """
+    message: str
+    expires_in_seconds: int
+    resend_available_in_seconds: int
+
+
+class ResetPasswordRequest(BaseModel):
+    """
+    Payload to verify recovery OTP and assign a replacement password.
+    """
+    email: EmailStr
+    code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+    new_password: str = Field(min_length=8, max_length=128)
+
+    @field_validator("new_password")
+    @classmethod
+    def password_must_be_mixed(cls, value: str) -> str:
+        if not any(c.isalpha() for c in value) or not any(c.isdigit() for c in value):
+            raise ValueError("Kata sandi baru harus mengandung huruf dan angka.")
+        return value
+
+
+class ResetPasswordResponse(BaseModel):
+    """
+    Confirms successful password reassignment.
+    """
+    message: str

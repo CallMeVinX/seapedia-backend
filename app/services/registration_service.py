@@ -130,11 +130,10 @@ async def start_registration(
     ip: str,
 ) -> tuple[str, Optional[str], Optional[str]]:
     """
-    Phase one: validate, throttle, stage the signup and mint an OTP.
+    Phase one: validate, throttle, check uniqueness, stage the signup, and generate an OTP.
 
-    Returns (recipient, full_name, code). A None code means the address already belongs to an
-    account and the caller should send the "account exists" notice instead — a distinction that
-    stays entirely server-side and never reaches the HTTP response.
+    Returns (recipient, full_name, code).
+    Raises HTTPException(400) if the email address is already registered or disallowed by validation rules.
     """
     canonical = canonicalize_email(email)
 
@@ -152,7 +151,10 @@ async def start_registration(
     existing = await db.scalar(select(User).where(User.email_canonical == canonical))
     if existing is not None:
         await db.commit()
-        return existing.email, None, None
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email has been used",
+        )
 
     code = generate_otp()
     staged = {

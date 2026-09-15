@@ -50,3 +50,23 @@ class RateLimitCounter(Base):
     key = Column(String(200), primary_key=True)
     count = Column(Integer, nullable=False, server_default=text("0"))
     window_start = Column(DateTime(timezone=True), nullable=False, server_default=text("NOW()"))
+
+
+class PasswordResetChallenge(Base):
+    """
+    Stores an active password reset challenge requested by a user.
+    Validates ownership of the account email via a 6-digit numeric OTP.
+    Includes rate-limiting and bounded attempt limits to mitigate brute-force guessing.
+    """
+    __tablename__ = "password_reset_challenges"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
+    email = Column(String(255), nullable=False)
+    email_canonical = Column(String(255), nullable=False, unique=True, index=True)
+    code_hash = Column(String(64), nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    attempts = Column(Integer, nullable=False, server_default=text("0"))
+    resend_count = Column(Integer, nullable=False, server_default=text("0"))
+    request_ip = Column(INET, nullable=True)
+    last_sent_at = Column(DateTime(timezone=True), server_default=text("NOW()"), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=text("NOW()"), nullable=False)

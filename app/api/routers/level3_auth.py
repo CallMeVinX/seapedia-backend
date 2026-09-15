@@ -3,6 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.db.session import get_db
 from app.schemas.auth_schema import (
+    ForgotPasswordRequest, ForgotPasswordResponse, ResetPasswordRequest, ResetPasswordResponse,
     SelectRoleRequest, TokenResponse, LoginRequest, RegisterRequest, LoginResponse,
     AddRoleRequest, VerifyRegistrationRequest, ResendOtpRequest, RegistrationChallengeResponse,
 )
@@ -12,7 +13,7 @@ from app.core.security import create_access_token, verify_password, get_password
 from datetime import timedelta
 from app.core.config import settings
 from app.models.user import User, UserRole, AppRole
-from app.services import registration_service
+from app.services import registration_service, password_reset_service
 from app.services.rate_limit_service import client_ip, hit as rate_limit_hit
 from app.core.email_rules import canonicalize_email
 
@@ -33,10 +34,9 @@ async def register(
     Opens a registration by staging the details and emailing a one-time code.
 
     No row is written to the users table here. Requiring proof of mailbox ownership before the
-    account exists is what stops automated sign-ups from populating the marketplace with
-    disposable accounts, claiming other people's addresses, or harvesting new-user vouchers.
-    The response is identical in every case, including when the address is already registered,
-    so the endpoint cannot be used to discover which emails hold an account.
+    account exists stops automated sign-ups and disposable accounts.
+    If the email is already registered, an immediate 400 Bad Request is returned to notify
+    the user and prevent unwanted email dispatch to existing accounts.
     """
     ip = client_ip(http_request)
 
@@ -49,12 +49,7 @@ async def register(
         ip=ip,
     )
 
-    if code is not None:
-        background_tasks.add_task(registration_service.dispatch_otp_email, recipient, full_name, code)
-    else:
-        # The address already has an account. The owner is told so out-of-band, which keeps the
-        # HTTP response uniform while still explaining to a real user why no code arrived.
-        background_tasks.add_task(registration_service.dispatch_account_exists_email, recipient)
+    background_tasks.add_task(registration_service.dispatch_otp_email, recipient, full_name, code)
 
     return RegistrationChallengeResponse(
         message=registration_service.GENERIC_REGISTER_MESSAGE,
@@ -281,3 +276,81 @@ async def add_role(
     await db.commit()
     
     return {"message": f"Successfully added role: {request.role}"}
+
+
+@router.post("/forgot-password", response_model=ForgotPasswordResponse)
+async def forgot_password(
+    request: ForgotPasswordRequest,
+    http_request: Request,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Initiates account password recovery.
+
+    Verifies account presence and dispatches a single-use 6-digit OTP to the registered mailbox.
+    Returns 400 Bad Request if the account is not found.
+    """
+    ip = client_ip(http_request)
+    recipient, full_name, code = await password_reset_service.request_password_reset(
+        db, email=request.email, ip=ip
+    )
+
+    background_tasks.add_task(
+        password_reset_service.dispatch_reset_password_email, recipient, full_name, code
+    )
+
+    return ForgotPasswordResponse(
+        message="Kode verifikasi pemulihan kata sandi telah dikirim ke email Anda.",
+        expires_in_seconds=settings.OTP_EXPIRE_MINUTES * 60,
+        resend_available_in_seconds=settings.OTP_RESEND_COOLDOWN_SECONDS,
+    )
+
+
+@router.post("/reset-password", response_model=ResetPasswordResponse)
+async def reset_password(
+    request: ResetPasswordRequest,
+    http_request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Validates recovery OTP and updates the account password.
+    """
+    ip = client_ip(http_request)
+    await password_reset_service.verify_and_reset_password(
+        db,
+        email=request.email,
+        code=request.code,
+        new_password=request.new_password,
+        ip=ip,
+    )
+
+    return ResetPasswordResponse(
+        message="Kata sandi berhasil diperbarui. Silakan masuk menggunakan kata sandi baru Anda."
+    )
+
+
+@router.post("/reset-password/resend", response_model=ForgotPasswordResponse)
+async def resend_reset_password_otp(
+    request: ForgotPasswordRequest,
+    http_request: Request,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Issues a replacement OTP for an ongoing password recovery session.
+    """
+    ip = client_ip(http_request)
+    recipient, full_name, code = await password_reset_service.resend_password_reset_otp(
+        db, email=request.email, ip=ip
+    )
+
+    background_tasks.add_task(
+        password_reset_service.dispatch_reset_password_email, recipient, full_name, code
+    )
+
+    return ForgotPasswordResponse(
+        message="Kode verifikasi baru telah dikirim ke email Anda.",
+        expires_in_seconds=settings.OTP_EXPIRE_MINUTES * 60,
+        resend_available_in_seconds=settings.OTP_RESEND_COOLDOWN_SECONDS,
+    )
