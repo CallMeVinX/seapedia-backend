@@ -93,3 +93,34 @@ def account_already_exists(email: str, login_url: str, reset_url: str) -> tuple[
         "Jika ini bukan Anda, tidak ada tindakan yang perlu dilakukan."
     )
     return subject, html, text
+
+
+def password_reset_otp(full_name: str, code: str, expire_minutes: int) -> tuple[str, str, str]:
+    """
+    Builds the notification message containing the password reset OTP.
+    Returns (subject, html, text) formatted cleanly for production delivery.
+    """
+    subject = f"{code} adalah kode pemulihan kata sandi {BRAND} Anda"
+
+    html = _wrap(f"""\
+    <p style="font-size:15px;color:#111827;margin:0 0 8px;">Halo <strong>{full_name}</strong>,</p>
+    <p style="font-size:15px;color:#374151;line-height:1.6;margin:0 0 24px;">
+      Kami menerima permintaan pengaturan ulang kata sandi untuk akun {BRAND} Anda.
+      Gunakan kode verifikasi berikut untuk melanjutkan.
+    </p>
+    <div style="text-align:center;background:#f0fdfa;border:1px solid #99f6e4;border-radius:10px;padding:20px;margin-bottom:24px;">
+      <div style="font-size:34px;font-weight:700;letter-spacing:10px;color:{_ACCENT};font-family:monospace;">{code}</div>
+    </div>
+    <p style="font-size:14px;color:#374151;line-height:1.6;margin:0;">
+      Kode ini berlaku selama <strong>{expire_minutes} menit</strong> dan hanya dapat dipakai satu kali.
+      Jika Anda tidak meminta perubahan kata sandi, abaikan email ini. Kata sandi akun Anda tetap aman.
+    </p>""")
+
+    text = (
+        f"Halo {full_name},\n\n"
+        f"Kode verifikasi pemulihan kata sandi {BRAND} Anda: {code}\n\n"
+        f"Kode berlaku selama {expire_minutes} menit dan hanya dapat dipakai satu kali.\n"
+        "Jangan bagikan kode ini kepada siapa pun.\n\n"
+        "Jika Anda tidak meminta pengaturan ulang kata sandi, abaikan email ini."
+    )
+    return subject, html, text

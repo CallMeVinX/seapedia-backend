@@ -7,4 +7,4 @@ from app.models.wallet import Wallet, WalletTransaction
 from app.models.promo import Promo, PromoProduct
 from app.models.voucher import Voucher
 from app.models.review import ApplicationReview
-from app.models.verification import PendingRegistration, RateLimitCounter
+from app.models.verification import PendingRegistration, RateLimitCounter, PasswordResetChallenge
